@@ -16,7 +16,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
-import { api, type AgentInfo, type HealthReport, type TemplateInfo } from "../lib/api";
+import { api, type AgentInfo, type AgentStatus, type HealthReport, type TemplateInfo } from "../lib/api";
 
 export function AgentsPage() {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
@@ -39,7 +39,7 @@ export function AgentsPage() {
     }
   };
 
-  const hasCreating = agents.some((a) => a.status === "CREATING");
+  const hasPendingTransition = agents.some((a) => a.status === "CREATING" || a.status === "STARTING");
 
   useEffect(() => {
     refresh();
@@ -47,9 +47,9 @@ export function AgentsPage() {
 
   // Poll faster when any agent is being created
   useEffect(() => {
-    const timer = setInterval(refresh, hasCreating ? 5_000 : 15_000);
+    const timer = setInterval(refresh, hasPendingTransition ? 5_000 : 15_000);
     return () => clearInterval(timer);
-  }, [hasCreating]);
+  }, [hasPendingTransition]);
 
   return (
     <div className="p-6">
@@ -102,6 +102,9 @@ function AgentCard({
   const navigate = useNavigate();
   const isRunning = agent.status === "RUNNING";
   const isCreating = agent.status === "CREATING";
+  const isStarting = agent.status === "STARTING";
+  const isTransitioning = isCreating || isStarting;
+  const isFailed = agent.status === "CREATE_FAILED" || agent.status === "START_FAILED";
   const healthy = report?.healthy ?? false;
 
   const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -240,7 +243,13 @@ function AgentCard({
       <div className="px-4 py-3 flex items-center justify-between border-b border-neutral-100">
         <div className="flex items-center gap-3 min-w-0">
           <div className={`w-2 h-2 rounded-full shrink-0 ${
-            isRunning ? (healthy || !report ? "bg-green-500" : "bg-yellow-500") : agent.status === "ERROR" ? "bg-red-500" : "bg-neutral-300"
+            isRunning
+              ? (healthy || !report ? "bg-green-500" : "bg-yellow-500")
+              : isTransitioning
+                ? "bg-blue-500"
+                : isFailed
+                  ? "bg-red-500"
+                  : "bg-neutral-300"
           }`} />
           <div className="min-w-0">
             <h3
@@ -255,7 +264,7 @@ function AgentCard({
             </p>
           </div>
         </div>
-        <StatusTag status={agent.status} healthy={isRunning ? healthy : undefined} />
+        <StatusTag status={agent.status} />
       </div>
 
       {/* Card body */}
@@ -263,7 +272,7 @@ function AgentCard({
         <InfoRow label="端口" value={String(agent.port)} />
         <InfoRow label="开机自启" value={agent.auto_start ? "已开启" : "未开启"} />
         {agent.install_method === "native" && (
-          <InfoRow label="SSH" value="ssh lima-agentbox" valueClass="text-xs font-mono select-all" />
+          <InfoRow label="SSH" value={`ssh ${agent.vm_name}`} valueClass="text-xs font-mono select-all" />
         )}
         {isCreating && (
           <InfoRow
@@ -272,7 +281,7 @@ function AgentCard({
             valueClass="text-blue-500"
           />
         )}
-        {report && !isCreating && (
+        {report && !isTransitioning && (
           <InfoRow
             label="健康状态"
             value={report.detail}
@@ -283,10 +292,10 @@ function AgentCard({
 
       {/* Card actions */}
       <div className="px-3 py-2.5 flex items-center gap-0.5 border-t border-neutral-100">
-        {isCreating ? (
+        {isTransitioning ? (
           <div className="flex items-center gap-1.5 pl-1 text-blue-500">
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            <span className="text-caption">部署中...</span>
+            <span className="text-caption">{isCreating ? "创建中..." : "启动中..."}</span>
           </div>
         ) : isRunning ? (
           <button onClick={handleStop} disabled={busy} className="btn-text" title="停止">
@@ -302,28 +311,28 @@ function AgentCard({
 
         <div className="w-px h-4 bg-neutral-200 mx-1" />
 
-        <button onClick={handleShellLocal} disabled={busy || isCreating} className="btn-text" title="打开本地终端">
+        <button onClick={handleShellLocal} disabled={busy || isTransitioning} className="btn-text" title="打开本地终端">
           <Terminal className="w-3.5 h-3.5" />
         </button>
-        <button onClick={handleShellWeb} disabled={busy || isCreating} className="btn-text" title="Web Shell">
+        <button onClick={handleShellWeb} disabled={busy || isTransitioning} className="btn-text" title="Web Shell">
           <Monitor className="w-3.5 h-3.5" />
         </button>
         <button onClick={() => navigate(`/agent/${agent.id}`)} className="btn-text" title="日志与监控">
           <ScrollText className="w-3.5 h-3.5" />
         </button>
-        <button onClick={handleBrowser} disabled={busy || isCreating} className="btn-text" title="在浏览器中打开">
+        <button onClick={handleBrowser} disabled={busy || isTransitioning} className="btn-text" title="在浏览器中打开">
           <ExternalLink className="w-3.5 h-3.5" />
         </button>
         <button onClick={() => navigate(`/config/${agent.id}`)} className="btn-text" title="配置">
           <Settings className="w-3.5 h-3.5" />
         </button>
-        <button onClick={handleExport} disabled={busy || isCreating} className="btn-text" title="导出备份">
+        <button onClick={handleExport} disabled={busy || isTransitioning} className="btn-text" title="导出备份">
           <Download className="w-3.5 h-3.5" />
         </button>
-        <button onClick={handleUpgrade} disabled={busy || isCreating} className="btn-text" title="升级">
+        <button onClick={handleUpgrade} disabled={busy || isTransitioning} className="btn-text" title="升级">
           <ArrowUpCircle className="w-3.5 h-3.5" />
         </button>
-        <button onClick={handleToggleAutoStart} disabled={busy || isCreating} className="btn-text" title="切换开机自启">
+        <button onClick={handleToggleAutoStart} disabled={busy || isTransitioning} className="btn-text" title="切换开机自启">
           {agent.auto_start
             ? <Power className="w-3.5 h-3.5 text-primary-500" />
             : <PowerOff className="w-3.5 h-3.5" />
@@ -333,21 +342,29 @@ function AgentCard({
         <div className="flex-1" />
 
         {confirmingDelete ? (
-          <button onClick={handleDeleteClick} className="btn-danger-text animate-pulse" title="再次点击确认删除">
+          <button
+            onClick={handleDeleteClick}
+            className="btn-danger-text animate-pulse"
+            title={isCreating ? "再次点击确认取消创建并删除，删除后不可恢复" : "再次点击确认彻底删除，删除后不可恢复"}
+          >
             <Trash2 className="w-3.5 h-3.5" />
-            <span className="text-caption">确认?</span>
+            <span className="text-caption">{isCreating ? "确认取消" : "确认删除"}</span>
           </button>
         ) : (
           <button
             onClick={handleDeleteClick}
             disabled={busy}
             className="btn-danger-text"
-            title={isCreating ? "取消创建" : "删除"}
+            title={isCreating ? "取消创建并删除，删除后不可恢复" : "删除实例，删除后不可恢复"}
           >
             <Trash2 className="w-3.5 h-3.5" />
-            {isCreating && <span className="text-caption">取消</span>}
+            <span className="text-caption">{isCreating ? "取消创建" : "删除"}</span>
           </button>
         )}
+      </div>
+
+      <div className="px-4 py-2 text-caption border-t border-red-100 bg-red-50 text-red-600">
+        {isCreating ? "取消创建会删除已创建的半成品虚拟机，且不可恢复。" : "删除实例会彻底删除对应虚拟机，删除后不可恢复。"}
       </div>
 
       {/* Config overlay */}
@@ -411,23 +428,21 @@ function InfoRow({
   );
 }
 
-function StatusTag({ status, healthy }: { status: string; healthy?: boolean }) {
-  const config: Record<string, { bg: string; text: string; label: string }> = {
-    RUNNING: { bg: "bg-green-50", text: "text-green-600", label: "运行中" },
-    STOPPED: { bg: "bg-neutral-100", text: "text-neutral-500", label: "已停止" },
+function StatusTag({ status }: { status: AgentStatus }) {
+  const config: Record<AgentStatus, { bg: string; text: string; label: string }> = {
     CREATING: { bg: "bg-blue-50", text: "text-blue-600", label: "创建中" },
-    ERROR: { bg: "bg-red-50", text: "text-red-600", label: "异常" },
+    CREATE_FAILED: { bg: "bg-red-50", text: "text-red-600", label: "创建失败" },
+    PENDING: { bg: "bg-neutral-100", text: "text-neutral-500", label: "待启动" },
+    STARTING: { bg: "bg-sky-50", text: "text-sky-600", label: "启动中" },
+    RUNNING: { bg: "bg-green-50", text: "text-green-600", label: "已启动" },
+    START_FAILED: { bg: "bg-red-50", text: "text-red-600", label: "启动异常" },
   };
 
-  let key = status;
-  if (status === "RUNNING" && healthy === false) {
-    key = "ERROR";
-  }
-  const c = config[key] ?? config.ERROR!;
+  const c = config[status];
 
   return (
     <span className={`inline-flex items-center px-2 py-0.5 rounded text-caption font-medium ${c.bg} ${c.text}`}>
-      {status === "RUNNING" && healthy === false ? "异常" : c.label}
+      {c.label}
     </span>
   );
 }

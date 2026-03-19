@@ -84,7 +84,7 @@ export function SetupOverlay({ onReady }: { onReady: () => void }) {
           <Box className="w-8 h-8 text-white" />
         </div>
 
-        <h1 className="text-xl font-semibold text-neutral-800 mb-2">AgentBox</h1>
+        <h1 className="text-xl font-semibold text-neutral-800 mb-2">AgentClawBox</h1>
 
         {stage === "needs-brew" ? (
           <>
@@ -93,7 +93,7 @@ export function SetupOverlay({ onReady }: { onReady: () => void }) {
               <span className="text-body font-semibold">需要安装 Homebrew</span>
             </div>
             <p className="text-caption text-neutral-500 text-center mb-4">
-              AgentBox 需要 Homebrew 来安装 Lima 虚拟环境。<br />
+              AgentClawBox 需要 Homebrew 来安装 Lima 虚拟环境。<br />
               请在终端运行以下命令，安装完成后重启应用。
             </p>
             <div className="w-full bg-neutral-900 rounded-lg p-3 mb-3 relative">

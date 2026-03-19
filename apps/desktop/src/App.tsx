@@ -4,6 +4,7 @@ import { Layout } from "./components/Layout";
 import { SetupOverlay } from "./components/SetupOverlay";
 import { AgentsPage } from "./pages/AgentsPage";
 import { MarketplacePage } from "./pages/MarketplacePage";
+import { AboutPage } from "./pages/AboutPage";
 import { ConfigPage } from "./pages/ConfigPage";
 import { AgentDetailPage } from "./pages/AgentDetailPage";
 import { WebShellPage } from "./pages/WebShellPage";
@@ -20,6 +21,7 @@ export default function App() {
           <Route element={<Layout />}>
             <Route path="/" element={<AgentsPage />} />
             <Route path="/marketplace" element={<MarketplacePage />} />
+            <Route path="/about" element={<AboutPage />} />
             <Route path="/config/:id" element={<ConfigPage />} />
             <Route path="/agent/:id" element={<AgentDetailPage />} />
             <Route path="/shell/:id" element={<WebShellPage />} />

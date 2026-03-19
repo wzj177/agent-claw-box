@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegram/nicetauri/refs/heads/master/crates/tauri-utils/schema.json",
-  "productName": "AgentBox",
+  "productName": "AgentClawBox",
   "version": "0.1.0",
-  "identifier": "com.agentbox.app",
+  "identifier": "com.AgentClawBox.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "AgentBox",
+        "title": "AgentClawBox",
         "width": 1200,
         "height": 800,
         "resizable": true,

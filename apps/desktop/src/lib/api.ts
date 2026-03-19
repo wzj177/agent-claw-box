@@ -10,14 +10,23 @@ export interface AgentInfo {
   template: string;
   instance_no: number;
   port: number;
-  status: string;
+  status: AgentStatus;
   auto_start: boolean;
   health_url: string | null;
   created_at: string;
   version: string;
   install_method: string;
   container_name: string;
+  vm_name: string;
 }
+
+export type AgentStatus =
+  | "CREATING"
+  | "CREATE_FAILED"
+  | "PENDING"
+  | "STARTING"
+  | "RUNNING"
+  | "START_FAILED";
 
 export interface AgentMetrics {
   cpu_percent: number;
@@ -154,8 +163,8 @@ export const api = {
   listAgentBackups: (id: string) =>
     invoke<AgentBackup[]>("list_agent_backups", { id }),
 
-  getSshInfo: () =>
-    invoke<SshConnectionInfo | null>("get_ssh_info"),
+  getSshInfo: (id: string) =>
+    invoke<SshConnectionInfo | null>("get_ssh_info", { id }),
 
   // PTY session management
   ptySpawn: (sessionId: string, agentId: string, rows: number, cols: number) =>

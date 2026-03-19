@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { Box, Store } from "lucide-react";
+import { Box, Store, UserCircle2 } from "lucide-react";
 
 export function Layout() {
   return (
@@ -10,16 +10,17 @@ export function Layout() {
           <div className="w-8 h-8 rounded-lg bg-primary-500 flex items-center justify-center">
             <Box className="w-4.5 h-4.5 text-white" />
           </div>
-          <span className="text-base font-semibold text-neutral-800 tracking-tight">AgentBox</span>
+          <span className="text-base font-semibold text-neutral-800 tracking-tight">AgentClawBox</span>
         </div>
 
         <nav className="flex-1 py-2 px-3 space-y-0.5">
           <SidebarLink to="/" icon={<Box className="w-4 h-4" />} label="我的实例" />
           <SidebarLink to="/marketplace" icon={<Store className="w-4 h-4" />} label="应用市场" />
+          <SidebarLink to="/about" icon={<UserCircle2 className="w-4 h-4" />} label="关于我" />
         </nav>
 
         <div className="px-5 py-3 text-caption text-neutral-400 border-t border-neutral-100">
-          AgentBox v0.1.0
+          AgentClawBox v0.1.0
         </div>
       </aside>
 

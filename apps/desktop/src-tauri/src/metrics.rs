@@ -3,11 +3,10 @@
 //!
 //! Also prunes old records (>24 h) on each cycle to prevent unbounded growth.
 
-use std::sync::Arc;
 use std::time::Duration;
 
+use crate::state::AppState;
 use sqlx::SqlitePool;
-use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 /// Parsed row from `docker stats --no-stream`.
@@ -22,8 +21,7 @@ struct StatsRow {
 
 /// Spawn a background task that collects metrics every `interval_secs` seconds.
 pub fn spawn_collector(
-    db: SqlitePool,
-    docker: Arc<RwLock<agentbox_docker::ContainerRuntime>>,
+    state: AppState,
     interval_secs: u64,
 ) {
     let interval = Duration::from_secs(interval_secs);
@@ -31,10 +29,10 @@ pub fn spawn_collector(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            if let Err(e) = collect_once(&db, &docker).await {
+            if let Err(e) = collect_once(&state).await {
                 warn!(error = %e, "metrics collection failed");
             }
-            if let Err(e) = prune(&db).await {
+            if let Err(e) = prune(&state.db).await {
                 warn!(error = %e, "metrics pruning failed");
             }
         }
@@ -42,44 +40,49 @@ pub fn spawn_collector(
 }
 
 /// Run one collection cycle: query running containers, fetch stats, insert rows.
-async fn collect_once(
-    db: &SqlitePool,
-    docker: &Arc<RwLock<agentbox_docker::ContainerRuntime>>,
-) -> anyhow::Result<()> {
-    // Get running agents from DB so we can map container_name → agent_id.
-    let agents: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, container_name FROM agents WHERE status = 'RUNNING'"
+async fn collect_once(state: &AppState) -> anyhow::Result<()> {
+    // Get running Docker-backed agents so we can map container_name → agent_id per VM.
+    let agents: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, container_name, vm_name FROM agents WHERE status = 'RUNNING' AND install_method != 'native'"
     )
-    .fetch_all(db)
+    .fetch_all(&state.db)
     .await?;
 
     if agents.is_empty() {
         return Ok(());
     }
 
-    let stats = fetch_docker_stats(docker).await?;
+    let mut by_vm: std::collections::HashMap<String, Vec<(String, String)>> = std::collections::HashMap::new();
+    for (agent_id, container_name, vm_name) in agents {
+        by_vm.entry(vm_name).or_default().push((agent_id, container_name));
+    }
 
-    for row in &stats {
-        // Find matching agent
-        if let Some((agent_id, _)) = agents.iter().find(|(_, cn)| cn == &row.container_name) {
-            sqlx::query(
-                "INSERT INTO agent_metrics (agent_id, cpu_percent, memory_mb, net_rx_kb, net_tx_kb, healthy, recorded_at)
-                 VALUES (?, ?, ?, ?, ?, 1, datetime('now'))"
-            )
-            .bind(agent_id)
-            .bind(row.cpu_percent)
-            .bind(row.memory_mb)
-            .bind(row.net_rx_kb)
-            .bind(row.net_tx_kb)
-            .execute(db)
-            .await?;
+    for (vm_name, vm_agents) in by_vm {
+        let docker = state.docker_for_vm_name(&vm_name);
+        let stats = fetch_docker_stats(&docker).await?;
 
-            debug!(
-                agent_id,
-                cpu = row.cpu_percent,
-                mem = row.memory_mb,
-                "recorded metrics"
-            );
+        for row in &stats {
+            if let Some((agent_id, _)) = vm_agents.iter().find(|(_, cn)| cn == &row.container_name) {
+                sqlx::query(
+                    "INSERT INTO agent_metrics (agent_id, cpu_percent, memory_mb, net_rx_kb, net_tx_kb, healthy, recorded_at)
+                     VALUES (?, ?, ?, ?, ?, 1, datetime('now'))"
+                )
+                .bind(agent_id)
+                .bind(row.cpu_percent)
+                .bind(row.memory_mb)
+                .bind(row.net_rx_kb)
+                .bind(row.net_tx_kb)
+                .execute(&state.db)
+                .await?;
+
+                debug!(
+                    agent_id,
+                    vm_name,
+                    cpu = row.cpu_percent,
+                    mem = row.memory_mb,
+                    "recorded metrics"
+                );
+            }
         }
     }
 
@@ -102,9 +105,8 @@ async fn prune(db: &SqlitePool) -> anyhow::Result<()> {
 
 /// Call `docker stats --no-stream --format` and parse the output.
 async fn fetch_docker_stats(
-    docker: &Arc<RwLock<agentbox_docker::ContainerRuntime>>,
+    docker: &agentbox_docker::ContainerRuntime,
 ) -> anyhow::Result<Vec<StatsRow>> {
-    let docker = docker.read().await;
     let stdout = docker.stats().await?;
 
     let mut rows = Vec::new();

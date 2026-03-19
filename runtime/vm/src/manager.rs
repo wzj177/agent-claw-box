@@ -44,6 +44,14 @@ impl VmManager {
         }
     }
 
+    /// Create a manager for a specific VM name using default resource sizing.
+    pub fn named(name: impl Into<String>) -> Self {
+        Self::new(VmConfig {
+            name: name.into(),
+            ..VmConfig::default()
+        })
+    }
+
     /// Create with default VM config.
     pub fn with_defaults() -> Self {
         Self::new(VmConfig {
@@ -79,6 +87,10 @@ impl VmManager {
         self.provider.exec_prefix(&self.config.name)
     }
 
+    pub fn name(&self) -> &str {
+        &self.config.name
+    }
+
     /// Build a full command to run `docker <args>` inside the VM.
     pub fn docker_command(&self, docker_args: &[&str]) -> (String, Vec<String>) {
         let prefix = self.docker_cmd_prefix();
@@ -95,22 +107,18 @@ impl VmManager {
         }
     }
 
-    /// Ensure the VM is fully ready (runtime installed, VM created, Docker available).
-    /// Returns a vec of stages completed for the frontend to display.
-    pub async fn ensure_ready(&self, on_progress: Option<&ProgressFn>) -> Result<()> {
+    /// Ensure the VM runtime itself is installed.
+    /// This does not create or start any instance VM.
+    pub async fn ensure_runtime_ready(&self, on_progress: Option<&ProgressFn>) -> Result<()> {
         let report = |msg: &str| {
-            info!("{}", msg);
+            info!(vm_name = %self.config.name, "{}", msg);
             if let Some(f) = on_progress {
                 f(msg);
             }
         };
 
-        // 1. Check if VM runtime is installed
         report("检查运行环境...");
         if !self.provider.is_runtime_installed().await {
-            // On macOS, Homebrew is required before Lima can be installed.
-            // Ask the provider to pre-check and report so the frontend can
-            // show a friendly guide if Homebrew is absent.
             report("正在检查前置依赖（Homebrew）...");
             if let Err(e) = self.provider.check_prerequisites().await {
                 return Err(e);
@@ -118,6 +126,21 @@ impl VmManager {
             report("正在安装运行环境，首次使用需要几分钟...");
             self.provider.install_runtime().await?;
         }
+
+        Ok(())
+    }
+
+    /// Ensure the VM is fully ready (runtime installed, VM created, Docker available).
+    /// Returns a vec of stages completed for the frontend to display.
+    pub async fn ensure_ready(&self, on_progress: Option<&ProgressFn>) -> Result<()> {
+        let report = |msg: &str| {
+            info!(vm_name = %self.config.name, "{}", msg);
+            if let Some(f) = on_progress {
+                f(msg);
+            }
+        };
+
+        self.ensure_runtime_ready(on_progress).await?;
 
         // 2. Check VM status
         report("检查虚拟环境...");
@@ -205,6 +228,11 @@ impl VmManager {
     /// Stop the VM.
     pub async fn stop(&self) -> Result<()> {
         self.provider.stop(&self.config.name).await
+    }
+
+    /// Delete the VM/runtime instance.
+    pub async fn delete(&self) -> Result<()> {
+        self.provider.delete(&self.config.name).await
     }
 
     /// Get current VM status.

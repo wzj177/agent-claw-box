@@ -38,6 +38,19 @@ export function MarketplacePage() {
     load();
   }, []);
 
+  useEffect(() => {
+    const refreshProvisioning = async () => {
+      try {
+        setProvisioning(await api.isProvisioning());
+      } catch {
+        // Ignore transient polling failures.
+      }
+    };
+
+    const timer = setInterval(refreshProvisioning, 3_000);
+    return () => clearInterval(timer);
+  }, []);
+
   const filtered = templates.filter(
     (t) =>
       t.name.toLowerCase().includes(search.toLowerCase()) ||
@@ -47,11 +60,13 @@ export function MarketplacePage() {
   const handleDeploy = async (template: TemplateInfo) => {
     setDeploying(template.id);
     setDeployError(null);
+    setProvisioning(true);
     try {
       await api.createAgent(template.name, template.id);
       navigate("/");
     } catch (e) {
       setDeployError(`${template.name} 部署失败: ${e}`);
+      setProvisioning(false);
     } finally {
       setDeploying(null);
     }

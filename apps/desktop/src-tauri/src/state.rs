@@ -1,11 +1,11 @@
 //! Application shared state.
 
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::Result;
 use sqlx::SqlitePool;
-use tokio::sync::RwLock;
 
 use agentbox_docker::ContainerRuntime;
 use agentbox_vm::VmManager;
@@ -15,7 +15,6 @@ use crate::health::HealthChecker;
 /// Wrapped in Arc so it can be cloned into background tasks.
 #[derive(Clone)]
 pub struct AppState {
-    pub docker: Arc<RwLock<ContainerRuntime>>,
     pub db: SqlitePool,
     pub health: Arc<HealthChecker>,
     pub vm: Arc<VmManager>,
@@ -24,6 +23,10 @@ pub struct AppState {
     pub vm_ready: Arc<AtomicBool>,
     /// Serialises agent provisioning so only one create/upgrade runs at a time.
     pub provisioning_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Number of create/upgrade operations currently in flight.
+    pub provisioning_count: Arc<AtomicUsize>,
+    /// Agent IDs currently being cancelled while provisioning is in flight.
+    pub provisioning_cancellations: Arc<tokio::sync::Mutex<HashSet<String>>>,
 }
 
 impl AppState {
@@ -36,10 +39,6 @@ impl AppState {
 
         // Create VM manager (auto-detects platform)
         let vm = Arc::new(VmManager::with_defaults());
-
-        // Docker runtime starts with no prefix;
-        // will be updated after VM is ready.
-        let docker = Arc::new(RwLock::new(ContainerRuntime::new()));
 
         // On Linux, Docker runs natively — no VM setup needed, mark ready immediately.
         // On macOS/Windows, will be set true after ensure_vm_ready() succeeds.
@@ -60,22 +59,52 @@ impl AppState {
             })
         });
 
-        Ok(Self { docker, db, health, vm, vm_ready, provisioning_lock: Arc::new(tokio::sync::Mutex::new(())) })
+        Ok(Self {
+            db,
+            health,
+            vm,
+            vm_ready,
+            provisioning_lock: Arc::new(tokio::sync::Mutex::new(())),
+            provisioning_count: Arc::new(AtomicUsize::new(0)),
+            provisioning_cancellations: Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        })
     }
 
-    /// Ensure the VM is fully ready and update the Docker runtime prefix.
+    pub fn vm_for_name(&self, name: &str) -> Arc<VmManager> {
+        Arc::new(VmManager::named(name))
+    }
+
+    pub fn docker_for_vm_name(&self, name: &str) -> ContainerRuntime {
+        let vm = self.vm_for_name(name);
+        ContainerRuntime::with_prefix(vm.docker_cmd_prefix())
+    }
+
+    /// Ensure the platform runtime is ready.
     /// Called from a background task on startup.
     pub async fn ensure_vm_ready(&self) -> Result<()> {
-        self.vm.ensure_ready(None).await?;
+        self.vm.ensure_runtime_ready(None).await?;
 
-        // Update Docker runtime to route through VM
-        let prefix = self.vm.docker_cmd_prefix();
-        tracing::info!(prefix = ?prefix, "Docker commands will route through VM");
-        self.docker.write().await.set_prefix(prefix);
-
-        // Mark environment as ready — unblocks all agent mutation commands
+        // Mark runtime as ready — instance VMs are created on demand per agent.
         self.vm_ready.store(true, Ordering::Release);
 
         Ok(())
+    }
+
+    pub async fn request_provisioning_cancel(&self, agent_id: &str) {
+        self.provisioning_cancellations
+            .lock()
+            .await
+            .insert(agent_id.to_string());
+    }
+
+    pub async fn clear_provisioning_cancel(&self, agent_id: &str) {
+        self.provisioning_cancellations.lock().await.remove(agent_id);
+    }
+
+    pub async fn is_provisioning_cancelled(&self, agent_id: &str) -> bool {
+        self.provisioning_cancellations
+            .lock()
+            .await
+            .contains(agent_id)
     }
 }

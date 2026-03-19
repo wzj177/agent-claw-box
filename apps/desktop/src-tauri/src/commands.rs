@@ -1,6 +1,7 @@
 //! Tauri IPC commands — all `#[tauri::command]` handlers.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use tauri::State;
@@ -14,9 +15,59 @@ use crate::system;
 
 const SECRET_MASK_PLACEHOLDER: &str = "********";
 const LEGACY_SECRET_MASK_PLACEHOLDER: &str = "••••••••";
+const STATUS_CREATING: &str = "CREATING";
+const STATUS_CREATE_FAILED: &str = "CREATE_FAILED";
+const STATUS_PENDING: &str = "PENDING";
+const STATUS_STARTING: &str = "STARTING";
+const STATUS_RUNNING: &str = "RUNNING";
+const STATUS_START_FAILED: &str = "START_FAILED";
 
 fn is_secret_mask_placeholder(value: &str) -> bool {
     value == SECRET_MASK_PLACEHOLDER || value == LEGACY_SECRET_MASK_PLACEHOLDER
+}
+
+fn normalize_legacy_status(status: &str) -> &str {
+    match status {
+        "STOPPED" | "ERROR" => STATUS_PENDING,
+        other => other,
+    }
+}
+
+pub async fn normalize_agent_statuses(state: &AppState) -> Result<(), String> {
+    sqlx::query(
+        "UPDATE agents SET status = ?, updated_at = datetime('now') WHERE status IN ('STOPPED', 'ERROR')"
+    )
+    .bind(STATUS_PENDING)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+pub async fn recover_interrupted_agent_statuses(state: &AppState) -> Result<(), String> {
+    // In-flight create/start tasks live only in the app process. If the desktop app
+    // restarts (for example during `cargo tauri dev` rebuild), persisted CREATING/
+    // STARTING rows are orphaned and must be marked failed instead of waiting forever.
+    sqlx::query(
+        "UPDATE agents SET status = ?, updated_at = datetime('now') WHERE status = ?"
+    )
+    .bind(STATUS_CREATE_FAILED)
+    .bind(STATUS_CREATING)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    sqlx::query(
+        "UPDATE agents SET status = ?, updated_at = datetime('now') WHERE status = ?"
+    )
+    .bind(STATUS_START_FAILED)
+    .bind(STATUS_STARTING)
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 fn shell_escape(value: &str) -> String {
@@ -56,20 +107,156 @@ fn openclaw_shell_exports(container_name: &str) -> String {
     format!("export OPENCLAW_HOME=\"{}\";", openclaw_home_dir(container_name))
 }
 
+async fn resolve_openclaw_gateway_token(
+    state: &AppState,
+    agent: &AgentInfo,
+) -> Option<String> {
+    let vm = vm_for_agent(state, agent);
+    let openclaw_exports = openclaw_shell_exports(&agent.container_name);
+
+    // Prefer the effective config seen inside the instance over the DB cache.
+    let config_token = vm
+        .shell_run(&format!(
+            "export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports} openclaw config get gateway.auth.token 2>/dev/null || true"
+        ))
+        .await
+        .ok()
+        .map(|output| output.trim().to_string())
+        .filter(|token| !token.is_empty());
+
+    if config_token.is_some() {
+        return config_token;
+    }
+
+    sqlx::query_scalar::<_, String>(
+        "SELECT config_value FROM agent_configs WHERE agent_id = ? AND config_key = 'gateway_token'"
+    )
+    .bind(&agent.id)
+    .fetch_optional(&state.db)
+    .await
+    .ok()
+    .flatten()
+    .filter(|token| !token.is_empty())
+}
+
+fn append_gateway_token_to_url(url: &str, token: &str) -> String {
+    if url.contains("token=") {
+        return url.to_string();
+    }
+
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}token={token}")
+}
+
+async fn agent_record_exists(db: &sqlx::SqlitePool, agent_id: &str) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM agents WHERE id = ?")
+        .bind(agent_id)
+        .fetch_one(db)
+        .await
+        .map(|count| count > 0)
+        .unwrap_or(false)
+}
+
+async fn provisioning_cancelled_or_deleted(state: &AppState, agent_id: &str) -> bool {
+    state.is_provisioning_cancelled(agent_id).await || !agent_record_exists(&state.db, agent_id).await
+}
+
+async fn ensure_provisioning_active(
+    state: &AppState,
+    vm: &agentbox_vm::VmManager,
+    agent_id: &str,
+) -> Result<(), anyhow::Error> {
+    if provisioning_cancelled_or_deleted(state, agent_id).await {
+        let _ = vm.delete().await;
+        anyhow::bail!("实例创建已取消");
+    }
+
+    Ok(())
+}
+
+async fn verify_vm_internet_connectivity(
+    state: &AppState,
+    vm: &agentbox_vm::VmManager,
+    agent_id: &str,
+    max_attempts: u32,
+    interval_secs: u64,
+) -> Result<(), anyhow::Error> {
+    let check_cmd = "curl --connect-timeout 8 --max-time 15 -fsS -o /dev/null https://openclaw.ai/ && echo OK || echo FAIL";
+
+    for attempt in 1..=max_attempts {
+        ensure_provisioning_active(state, vm, agent_id).await?;
+        tracing::info!(attempt, max_attempts, "Verifying VM internet connectivity...");
+
+        let net_ok = vm.shell_run(check_cmd).await.unwrap_or_default();
+        if net_ok.trim() == "OK" {
+            tracing::info!(attempt, max_attempts, "VM internet connectivity OK");
+            return Ok(());
+        }
+
+        tracing::warn!(attempt, max_attempts, "VM internet connectivity check failed");
+        if attempt < max_attempts {
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+        }
+    }
+
+    anyhow::bail!(
+        "VM 无法访问互联网，请检查网络连接后重试。已尝试 {max_attempts} 次。\n\
+         可在终端运行: limactl shell {vm_name} -- curl -v https://openclaw.ai/",
+        vm_name = vm.name(),
+    );
+}
+
+fn vm_name_for_instance(template: &str, instance_no: i64) -> String {
+    format!("agentbox-{}-{}", template, instance_no)
+}
+
+fn vm_for_agent(state: &AppState, agent: &AgentInfo) -> Arc<agentbox_vm::VmManager> {
+    state.vm_for_name(&agent.vm_name)
+}
+
+fn docker_for_agent(state: &AppState, agent: &AgentInfo) -> agentbox_docker::ContainerRuntime {
+    state.docker_for_vm_name(&agent.vm_name)
+}
+
+struct ProvisioningCounterGuard {
+    counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
+}
+
+impl ProvisioningCounterGuard {
+    fn new(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self {
+            counter: Some(counter),
+        }
+    }
+
+    fn release_to_spawn(mut self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.counter.take().expect("provisioning counter already released")
+    }
+}
+
+impl Drop for ProvisioningCounterGuard {
+    fn drop(&mut self) {
+        if let Some(counter) = &self.counter {
+            counter.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
 async fn stop_native_agent_process(
     state: &AppState,
     agent: &AgentInfo,
     start_cmd: Option<&str>,
 ) {
+    let vm = vm_for_agent(state, agent);
     let pid_path = native_pid_path(&agent.container_name);
     let pid_stop_cmd = format!(
         "if [ -f {pid_path} ]; then pid=$(cat {pid_path}); kill \"$pid\" 2>/dev/null || true; rm -f {pid_path}; fi"
     );
-    let _ = state.vm.shell_run(&pid_stop_cmd).await;
+    let _ = vm.shell_run(&pid_stop_cmd).await;
 
     if agent.template == "openclaw" {
-        let _ = state
-            .vm
+        let _ = vm
             .shell_run(&format!(
                 "pkill -f 'openclaw gateway --port {}' 2>/dev/null || true",
                 agent.port
@@ -77,8 +264,7 @@ async fn stop_native_agent_process(
             .await;
     } else if let Some(start_cmd) = start_cmd {
         let proc_name = start_cmd.split_whitespace().next().unwrap_or("agent");
-        let _ = state
-            .vm
+        let _ = vm
             .shell_run(&format!("pkill -f '{}' 2>/dev/null || true", shell_escape(proc_name)))
             .await;
     }
@@ -86,20 +272,20 @@ async fn stop_native_agent_process(
 
 async fn upsert_openclaw_auth_profile(
     state: &AppState,
-    container_name: &str,
+    agent: &AgentInfo,
     provider_id: &str,
     api_key: &str,
 ) -> Result<(), String> {
+    let vm = vm_for_agent(state, agent);
     let auth_store_path = format!(
         "{}/agents/main/agent/auth-profiles.json",
-        openclaw_state_dir(container_name)
+        openclaw_state_dir(&agent.container_name)
     );
-    let shell_prefix = openclaw_shell_exports(container_name);
-    let existing = state
-        .vm
+    let shell_prefix = openclaw_shell_exports(&agent.container_name);
+    let existing = vm
         .shell_run(&format!(
             "{shell_prefix} mkdir -p {dir} && if [ -f {auth_store_path} ]; then cat {auth_store_path}; else printf '{{}}'; fi",
-            dir = format!("{}/agents/main/agent", openclaw_state_dir(container_name)),
+            dir = format!("{}/agents/main/agent", openclaw_state_dir(&agent.container_name)),
             auth_store_path = auth_store_path,
         ))
         .await
@@ -127,15 +313,15 @@ async fn upsert_openclaw_auth_profile(
     let write_cmd = format!(
         "{shell_prefix} mkdir -p {dir} && printf '%s\n' '{}' > {auth_store_path}",
         auth_json.replace('\'', "'\\''"),
-        dir = format!("{}/agents/main/agent", openclaw_state_dir(container_name)),
+        dir = format!("{}/agents/main/agent", openclaw_state_dir(&agent.container_name)),
         auth_store_path = auth_store_path,
     );
-    state.vm.shell_run(&write_cmd).await.map_err(|e| e.to_string())?;
+    vm.shell_run(&write_cmd).await.map_err(|e| e.to_string())?;
 
     let order_cmd = format!(
         "export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {shell_prefix} openclaw models auth order set --provider '{provider_id}' --agent main '{profile_id}' 2>/dev/null || true"
     );
-    let _ = state.vm.shell_run(&order_cmd).await;
+    let _ = vm.shell_run(&order_cmd).await;
 
     Ok(())
 }
@@ -150,35 +336,35 @@ fn openclaw_provider_id(provider: &str) -> &str {
 async fn reconcile_agent_runtime_status(state: &AppState, agent: &AgentInfo) -> Option<String> {
     match agent.install_method.as_str() {
         "native" => {
+            let vm = vm_for_agent(state, agent);
             let url = agent.health_url.clone()?;
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
                 .ok()?;
             match client.get(url).send().await {
-                Ok(resp) if resp.status().is_success() => Some("RUNNING".to_string()),
+                Ok(resp) if resp.status().is_success() => Some(STATUS_RUNNING.to_string()),
                 _ => {
-                    let port_check = state
-                        .vm
+                    if vm
                         .shell_run(&format!(
-                            "bash -lc '</dev/tcp/127.0.0.1/{}' >/dev/null 2>&1 && echo OPEN || echo CLOSED",
+                            "bash -lc 'true </dev/tcp/127.0.0.1/{}' >/dev/null 2>&1",
                             agent.port
                         ))
                         .await
-                        .ok()?;
-                    if port_check.trim() == "OPEN" {
-                        Some("RUNNING".to_string())
+                        .is_ok()
+                    {
+                        Some(STATUS_RUNNING.to_string())
                     } else {
-                        Some("STOPPED".to_string())
+                        Some(STATUS_PENDING.to_string())
                     }
                 }
             }
         }
         "docker" | "compose" => {
-            let docker = state.docker.read().await;
+            let docker = docker_for_agent(state, agent);
             match docker.status(&agent.container_name).await.ok()? {
-                ContainerStatus::Running => Some("RUNNING".to_string()),
-                ContainerStatus::Created | ContainerStatus::Stopped => Some("STOPPED".to_string()),
+                ContainerStatus::Running => Some(STATUS_RUNNING.to_string()),
+                ContainerStatus::Created | ContainerStatus::Stopped => Some(STATUS_PENDING.to_string()),
                 ContainerStatus::Removing | ContainerStatus::Error(_) => None,
             }
         }
@@ -187,20 +373,30 @@ async fn reconcile_agent_runtime_status(state: &AppState, agent: &AgentInfo) -> 
 }
 
 pub async fn reconcile_agent_statuses(state: &AppState) -> Result<(), String> {
-    let agents: Vec<AgentInfo> = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents"
-    )
+    let agents: Vec<AgentInfo> = sqlx::query_as("SELECT * FROM agents")
     .fetch_all(&state.db)
     .await
     .map_err(|e| e.to_string())?;
 
     for agent in agents {
+        // Provisioning may take minutes for native templates. During that window
+        // the port is expected to be closed, so skip reconciliation entirely.
+        if matches!(agent.status.as_str(), STATUS_CREATING | STATUS_STARTING) {
+            continue;
+        }
+
         if let Some(actual_status) = reconcile_agent_runtime_status(state, &agent).await {
-            if agent.status != actual_status {
+            let desired_status = if actual_status == STATUS_PENDING
+                && matches!(agent.status.as_str(), STATUS_CREATE_FAILED | STATUS_START_FAILED)
+            {
+                agent.status.clone()
+            } else {
+                actual_status
+            };
+
+            if agent.status != desired_status {
                 sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
-                    .bind(&actual_status)
+                    .bind(&desired_status)
                     .bind(&agent.id)
                     .execute(&state.db)
                     .await
@@ -227,6 +423,7 @@ pub struct AgentInfo {
     pub version: String,
     pub install_method: String,
     pub container_name: String,
+    pub vm_name: String,
 }
 
 /// Metrics snapshot for a single agent.
@@ -278,30 +475,32 @@ pub struct AgentConfigEntry {
 /// List all agents.
 #[tauri::command]
 pub async fn list_agents(state: State<'_, AppState>) -> Result<Vec<AgentInfo>, String> {
+    let _ = normalize_agent_statuses(&state).await;
     let _ = reconcile_agent_statuses(&state).await;
 
-    let rows: Vec<AgentInfo> = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port,
-                status, auto_start, health_url, created_at,
-                version, install_method, container_name
-         FROM agents ORDER BY created_at DESC"
-    )
+    let mut rows: Vec<AgentInfo> = sqlx::query_as("SELECT * FROM agents ORDER BY created_at DESC")
     .fetch_all(&state.db)
     .await
     .map_err(|e: sqlx::Error| e.to_string())?;
 
+    for row in &mut rows {
+        row.status = normalize_legacy_status(&row.status).to_string();
+    }
+
     Ok(rows)
 }
 
-/// Check whether any agent is currently being provisioned (CREATING).
+/// Check whether any agent is currently being provisioned (creating VM/container).
 #[tauri::command]
 pub async fn is_provisioning(state: State<'_, AppState>) -> Result<bool, String> {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agents WHERE status = 'CREATING'"
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    if state.provisioning_count.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        return Ok(true);
+    }
+
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents WHERE status = 'CREATING'")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(count > 0)
 }
 
@@ -448,15 +647,19 @@ pub async fn create_agent(
     check_vm_ready(&state)?;
 
     // Reject if another agent is already being provisioned
-    let creating_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agents WHERE status = 'CREATING'"
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    if state.provisioning_count.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        return Err("已有实例正在创建中，请等待完成后再部署新实例".into());
+    }
+
+    let creating_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents WHERE status = 'CREATING'")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
     if creating_count > 0 {
         return Err("已有实例正在创建中，请等待完成后再部署新实例".into());
     }
+
+    let provisioning_guard = ProvisioningCounterGuard::new(state.provisioning_count.clone());
 
     // Load template definition
     let tmpl = template::load_template(&template).map_err(|e| e.to_string())?;
@@ -477,7 +680,8 @@ pub async fn create_agent(
     let base_port = tmpl.ports.first().map(|p| p.host).unwrap_or(3000);
     let port = find_available_port(&state.db, base_port).await?;
 
-    let container_name = format!("agentbox-{}-{}", template, instance_no);
+    let vm_name = vm_name_for_instance(&template, instance_no);
+    let container_name = vm_name.clone();
 
     let health_url = tmpl.health.url.replace(
         &format!(":{}", tmpl.ports.first().map(|p| p.container).unwrap_or(0)),
@@ -487,8 +691,8 @@ pub async fn create_agent(
     // Insert DB record
     sqlx::query(
         "INSERT INTO agents (id, name, template, instance_no, port, status, health_url,
-                             version, install_method, container_name, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'CREATING', ?, ?, ?, ?, ?, ?)"
+                            version, install_method, container_name, vm_name, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'CREATING', ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&id).bind(&name).bind(&template)
     .bind(instance_no).bind(port)
@@ -496,6 +700,7 @@ pub async fn create_agent(
     .bind(&tmpl.version)
     .bind(&tmpl.install_method)
     .bind(&container_name)
+        .bind(&vm_name)
     .bind(&now).bind(&now)
     .execute(&state.db)
     .await
@@ -506,57 +711,72 @@ pub async fn create_agent(
     let ret_install_method = tmpl.install_method.clone();
 
     // Spawn provisioning in background
-    let docker = state.docker.clone();
-    let vm = state.vm.clone();
+    let app_state = state.inner().clone();
     let db = state.db.clone();
     let agent_id = id.clone();
     let c_name = container_name.clone();
+    let vm_name_clone = vm_name.clone();
     let prov_lock = state.provisioning_lock.clone();
+    let prov_count = provisioning_guard.release_to_spawn();
     tauri::async_runtime::spawn(async move {
         // Acquire provisioning lock — only one create/upgrade at a time
         let _guard = prov_lock.lock().await;
-        let docker_guard = docker.read().await;
+        let docker = app_state.docker_for_vm_name(&vm_name_clone);
+        let vm = app_state.vm_for_name(&vm_name_clone);
         // 30-minute timeout prevents agents from being stuck in CREATING forever
         // (native agents like OpenClaw may need 20+ min for npm install with retries)
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30 * 60),
-            provision_agent(&docker_guard, &vm, &tmpl, &c_name, port, &db, &agent_id),
+            provision_agent(&app_state, &docker, &vm, &tmpl, &c_name, port, &db, &agent_id),
         ).await;
         let final_result = match result {
             Ok(r) => r,
             Err(_) => Err(anyhow::anyhow!("创建超时（超过30分钟），请删除此实例后重试")),
         };
+        let cancelled = provisioning_cancelled_or_deleted(&app_state, &agent_id).await;
         match final_result {
             Ok(result) => {
-                if result.needs_manual_install {
-                    // Install failed — set STOPPED so user can shell in and install manually
-                    tracing::warn!(agent_id = %agent_id, "Agent set to STOPPED — manual install required");
+                if cancelled {
+                    let _ = vm.delete().await;
+                } else if result.needs_manual_install {
+                    tracing::warn!(agent_id = %agent_id, "Agent set to CREATE_FAILED — manual install required");
                     let _ = sqlx::query(
-                        "UPDATE agents SET status = 'STOPPED', updated_at = datetime('now') WHERE id = ?"
+                        "UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?"
                     )
+                    .bind(STATUS_CREATE_FAILED)
                     .bind(&agent_id)
                     .execute(&db)
                     .await;
                 } else {
                     tracing::info!(agent_id = %agent_id, "Agent provisioned successfully");
                     let _ = sqlx::query(
-                        "UPDATE agents SET status = 'RUNNING', updated_at = datetime('now') WHERE id = ?"
+                        "UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?"
                     )
+                    .bind(STATUS_RUNNING)
                     .bind(&agent_id)
                     .execute(&db)
                     .await;
                 }
             }
             Err(e) => {
-                tracing::error!(agent_id = %agent_id, error = %e, "Failed to provision agent");
-                let _ = sqlx::query(
-                    "UPDATE agents SET status = 'ERROR', updated_at = datetime('now') WHERE id = ?"
-                )
-                .bind(&agent_id)
-                .execute(&db)
-                .await;
+                if cancelled {
+                    let _ = vm.delete().await;
+                    tracing::info!(agent_id = %agent_id, "Provisioning cancelled while create was in progress");
+                } else {
+                    tracing::error!(agent_id = %agent_id, error = %e, "Failed to provision agent");
+                    let _ = sqlx::query(
+                        "UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?"
+                    )
+                    .bind(STATUS_CREATE_FAILED)
+                    .bind(&agent_id)
+                    .execute(&db)
+                    .await;
+                }
             }
         }
+
+        app_state.clear_provisioning_cancel(&agent_id).await;
+        prov_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     });
 
     Ok(AgentInfo {
@@ -565,13 +785,14 @@ pub async fn create_agent(
         template,
         instance_no,
         port,
-        status: "CREATING".into(),
+        status: STATUS_CREATING.into(),
         auto_start: false,
         health_url: Some(health_url),
         created_at: now,
         version: ret_version,
         install_method: ret_install_method,
         container_name,
+        vm_name,
     })
 }
 
@@ -584,6 +805,7 @@ struct ProvisionResult {
 
 /// Actually provision the agent container/compose/native process.
 async fn provision_agent(
+    state: &AppState,
     docker: &agentbox_docker::ContainerRuntime,
     vm: &agentbox_vm::VmManager,
     tmpl: &AgentTemplate,
@@ -594,14 +816,18 @@ async fn provision_agent(
 ) -> Result<ProvisionResult, anyhow::Error> {
     use crate::network::NetworkPolicy;
 
+    vm.ensure_ready(None).await?;
+    ensure_provisioning_active(state, vm, agent_id).await?;
+
     // For Docker/Compose/Script methods, ensure Docker is installed on-demand
     if matches!(tmpl.install_method.as_str(), "docker" | "compose" | "script") {
-        if !vm.provider().is_docker_ready(agentbox_vm::VM_NAME).await {
+        if !vm.provider().is_docker_ready(vm.name()).await {
             tracing::info!("Docker not found, installing on-demand...");
-            vm.provider().install_docker(agentbox_vm::VM_NAME).await?;
+            vm.provider().install_docker(vm.name()).await?;
         }
         // Ensure agentbox-net exists
         NetworkPolicy::ensure_network_via(docker).await?;
+        ensure_provisioning_active(state, vm, agent_id).await?;
     }
 
     let template_dir = template::templates_dir()
@@ -647,6 +873,7 @@ async fn provision_agent(
             };
 
             docker.create_with_args(&config, &extra_args).await?;
+            ensure_provisioning_active(state, vm, agent_id).await?;
         }
 
         "compose" => {
@@ -658,6 +885,7 @@ async fn provision_agent(
 
             tracing::info!(compose = %compose_path, "Starting Docker Compose");
             run_compose(docker, &compose_path, container_name, host_port, &data_dir).await?;
+            ensure_provisioning_active(state, vm, agent_id).await?;
         }
 
         "script" => {
@@ -691,6 +919,7 @@ async fn provision_agent(
             };
 
             docker.create_with_args(&config, &extra_args).await?;
+            ensure_provisioning_active(state, vm, agent_id).await?;
         }
 
         "native" => {
@@ -717,31 +946,24 @@ async fn provision_agent(
                 String::new()
             };
 
-            // Network pre-flight: verify VM can reach the internet before running install_cmd
-            tracing::info!("Verifying VM internet connectivity...");
-            let net_ok = vm.shell_run(
-                "curl --max-time 8 -fsS -o /dev/null https://openclaw.ai/ && echo OK || echo FAIL"
-            ).await.unwrap_or_default();
-            if net_ok.trim() != "OK" {
-                anyhow::bail!(
-                    "VM 无法访问互联网，请检查网络连接后重试。\n\
-                     可在终端运行: limactl shell agentbox -- curl -v https://openclaw.ai/"
-                );
-            }
-            tracing::info!("VM internet connectivity OK");
+            // Network pre-flight: verify VM can reach the internet before running install_cmd.
+            // DNS and outbound networking may need a short warm-up right after first boot.
+            verify_vm_internet_connectivity(state, vm, agent_id, 5, 5).await?;
 
             tracing::info!(cmd = %install_cmd, "Installing native agent in VM");
             match vm.shell_run(install_cmd).await {
                 Ok(_) => {
                     tracing::info!("Native agent install completed successfully");
+                    ensure_provisioning_active(state, vm, agent_id).await?;
                 }
                 Err(e) => {
                     tracing::warn!(container_name, error = %e, "Native agent auto-install failed, manual install required");
                     tracing::warn!(
                         "请在终端中手动安装:\n  \
-                         1. 运行: limactl shell agentbox\n  \
+                         1. 运行: limactl shell {vm_name}\n  \
                          2. 执行安装命令: {install_cmd}\n  \
-                         3. 安装完成后在界面点击 [启动] 按钮"
+                         3. 安装完成后在界面点击 [启动] 按钮",
+                        vm_name = vm.name(),
                     );
                     return Ok(ProvisionResult {
                         needs_manual_install: true,
@@ -779,6 +1001,7 @@ async fn provision_agent(
                 extra_env = format!("OPENCLAW_GATEWAY_TOKEN={token}");
                 tracing::info!("Generated OpenClaw gateway token and wrote to instance OpenClaw state dir");
             }
+            ensure_provisioning_active(state, vm, agent_id).await?;
 
             let run_cmd = if extra_env.is_empty() {
                 format!(
@@ -793,6 +1016,7 @@ async fn provision_agent(
             let pid = vm.shell_run(&run_cmd).await?;
             let pid = pid.trim().to_string();
             tracing::info!(container_name, pid = %pid, "Native agent started");
+            ensure_provisioning_active(state, vm, agent_id).await?;
 
             // Brief pause + verify the process is still alive
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -821,6 +1045,8 @@ async fn provision_agent(
                 // Don't fail hard — the background health checker will continue monitoring.
                 // Log the warning so users can investigate.
             }
+
+            ensure_provisioning_active(state, vm, agent_id).await?;
 
             return Ok(ProvisionResult {
                 needs_manual_install: false,
@@ -902,24 +1128,31 @@ pub async fn start_agent(id: String, state: State<'_, AppState>) -> Result<(), S
     // Verify VM/Docker is ready
     check_vm_ready(&state)?;
 
-    let agent: AgentInfo = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE id = ?"
-    )
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
     .bind(&id)
     .fetch_one(&state.db)
     .await
     .map_err(|e| e.to_string())?;
 
-    match agent.install_method.as_str() {
+    sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(STATUS_STARTING)
+        .bind(&id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let start_result: Result<(), String> = async {
+        let vm = vm_for_agent(&state, &agent);
+        vm.ensure_ready(None).await.map_err(|e| e.to_string())?;
+
+        match agent.install_method.as_str() {
         "compose" => {
             let tmpl = template::load_template(&agent.template).map_err(|e| e.to_string())?;
             let compose_file = tmpl.runtime.compose_file.as_deref().unwrap_or("docker-compose.yml");
             let template_dir = template::templates_dir().join(&agent.template);
             let compose_path = template_dir.join(compose_file);
 
-            let docker = state.docker.read().await;
+            let docker = docker_for_agent(&state, &agent);
             let (ok, _, stderr) = docker.compose(
                 &["-f", &compose_path.to_string_lossy(), "-p", &agent.container_name, "start"],
                 &[],
@@ -930,13 +1163,14 @@ pub async fn start_agent(id: String, state: State<'_, AppState>) -> Result<(), S
             }
         }
         "native" => {
+            let vm = vm_for_agent(&state, &agent);
             let tmpl = template::load_template(&agent.template).map_err(|e| e.to_string())?;
             let start_cmd = tmpl.runtime.start_cmd.as_deref()
                 .ok_or_else(|| "Native template missing runtime.start_cmd".to_string())?;
             let log_path = native_log_path(&agent.container_name);
             let pid_path = native_pid_path(&agent.container_name);
-            let _ = state.vm.shell_run(&format!("mkdir -p {} {}", native_log_dir(), native_pid_dir())).await;
-            state.vm.shell_run(&format!(": > {log_path}")).await.map_err(|e| e.to_string())?;
+            let _ = vm.shell_run(&format!("mkdir -p {} {}", native_log_dir(), native_pid_dir())).await;
+            vm.shell_run(&format!(": > {log_path}")).await.map_err(|e| e.to_string())?;
 
             // For openclaw: inject gateway token env var
             let mut extra_env = String::new();
@@ -944,7 +1178,7 @@ pub async fn start_agent(id: String, state: State<'_, AppState>) -> Result<(), S
             if agent.template == "openclaw" {
                 let openclaw_home = openclaw_home_dir(&agent.container_name);
                 let openclaw_state = openclaw_state_dir(&agent.container_name);
-                let _ = state.vm.shell_run(&format!(
+                let _ = vm.shell_run(&format!(
                     "mkdir -p {} {}",
                     openclaw_home,
                     openclaw_state,
@@ -966,21 +1200,40 @@ pub async fn start_agent(id: String, state: State<'_, AppState>) -> Result<(), S
                 "bash -c 'export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports}export AGENTBOX_PORT={}; {extra_env}nohup {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'",
                 agent.port
             );
-            state.vm.shell_run(&run_cmd).await.map_err(|e| e.to_string())?;
+            vm.shell_run(&run_cmd).await.map_err(|e| e.to_string())?;
             tracing::info!(port = agent.port, "Native agent started — Lima auto-forwards port when ready");
         }
         _ => {
-            state.docker.read().await.start(&agent.container_name).await.map_err(|e| e.to_string())?;
+            let docker = docker_for_agent(&state, &agent);
+            docker.start(&agent.container_name).await.map_err(|e| e.to_string())?;
         }
     }
 
-    sqlx::query("UPDATE agents SET status = 'RUNNING', updated_at = datetime('now') WHERE id = ?")
-        .bind(&id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    .await;
 
-    Ok(())
+    match start_result {
+        Ok(()) => {
+            sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
+                .bind(STATUS_RUNNING)
+                .bind(&id)
+                .execute(&state.db)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            Ok(())
+        }
+        Err(e) => {
+            let _ = sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
+                .bind(STATUS_START_FAILED)
+                .bind(&id)
+                .execute(&state.db)
+                .await;
+
+            Err(e)
+        }
+    }
 }
 
 /// Stop a running agent.
@@ -988,11 +1241,7 @@ pub async fn start_agent(id: String, state: State<'_, AppState>) -> Result<(), S
 pub async fn stop_agent(id: String, state: State<'_, AppState>) -> Result<(), String> {
     check_vm_ready(&state)?;
 
-    let agent: AgentInfo = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE id = ?"
-    )
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
     .bind(&id)
     .fetch_one(&state.db)
     .await
@@ -1005,7 +1254,7 @@ pub async fn stop_agent(id: String, state: State<'_, AppState>) -> Result<(), St
             let template_dir = template::templates_dir().join(&agent.template);
             let compose_path = template_dir.join(compose_file);
 
-            let docker = state.docker.read().await;
+            let docker = docker_for_agent(&state, &agent);
             let (ok, _, stderr) = docker.compose(
                 &["-f", &compose_path.to_string_lossy(), "-p", &agent.container_name, "stop"],
                 &[],
@@ -1020,11 +1269,13 @@ pub async fn stop_agent(id: String, state: State<'_, AppState>) -> Result<(), St
             stop_native_agent_process(&state, &agent, tmpl.runtime.start_cmd.as_deref()).await;
         }
         _ => {
-            state.docker.read().await.stop(&agent.container_name).await.map_err(|e| e.to_string())?;
+            let docker = docker_for_agent(&state, &agent);
+            docker.stop(&agent.container_name).await.map_err(|e| e.to_string())?;
         }
     }
 
-    sqlx::query("UPDATE agents SET status = 'STOPPED', updated_at = datetime('now') WHERE id = ?")
+    sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(STATUS_PENDING)
         .bind(&id)
         .execute(&state.db)
         .await
@@ -1036,47 +1287,53 @@ pub async fn stop_agent(id: String, state: State<'_, AppState>) -> Result<(), St
 /// Delete an agent and its container.
 #[tauri::command]
 pub async fn delete_agent(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let agent: AgentInfo = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE id = ?"
-    )
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
     .bind(&id)
     .fetch_one(&state.db)
     .await
     .map_err(|e| e.to_string())?;
 
-    // Best-effort container/compose/process cleanup — skip if VM/Docker not ready
+    if agent.status == STATUS_CREATING {
+        state.request_provisioning_cancel(&id).await;
+    }
+
+    let vm = vm_for_agent(&state, &agent);
+
+    // Best-effort VM/container/process cleanup — skip if runtime not ready.
+    // On macOS this ultimately maps to `limactl delete --force <vm_name>`.
     let vm_ready = state.vm_ready.load(std::sync::atomic::Ordering::Acquire);
 
     if vm_ready {
         let cleanup = async {
-            match agent.install_method.as_str() {
-                "compose" => {
-                    let docker = state.docker.read().await;
-                    if let Ok(tmpl) = template::load_template(&agent.template) {
-                        let compose_file = tmpl.runtime.compose_file.as_deref().unwrap_or("docker-compose.yml");
-                        let template_dir = template::templates_dir().join(&agent.template);
-                        let compose_path = template_dir.join(compose_file);
-                        let _ = docker.compose(
-                            &["-f", &compose_path.to_string_lossy(), "-p", &agent.container_name, "down", "-v"],
-                            &[],
-                        ).await;
+            if vm.docker_cmd_prefix().is_empty() {
+                match agent.install_method.as_str() {
+                    "compose" => {
+                        let docker = docker_for_agent(&state, &agent);
+                        if let Ok(tmpl) = template::load_template(&agent.template) {
+                            let compose_file = tmpl.runtime.compose_file.as_deref().unwrap_or("docker-compose.yml");
+                            let template_dir = template::templates_dir().join(&agent.template);
+                            let compose_path = template_dir.join(compose_file);
+                            let _ = docker.compose(
+                                &["-f", &compose_path.to_string_lossy(), "-p", &agent.container_name, "down", "-v"],
+                                &[],
+                            ).await;
+                        }
+                    }
+                    "native" => {
+                        if let Ok(tmpl) = template::load_template(&agent.template) {
+                            stop_native_agent_process(&state, &agent, tmpl.runtime.start_cmd.as_deref()).await;
+                        }
+                        let log_path = native_log_path(&agent.container_name);
+                        let pid_path = native_pid_path(&agent.container_name);
+                        let _ = vm.shell_run(&format!("rm -f {log_path} {pid_path}")).await;
+                    }
+                    _ => {
+                        let docker = docker_for_agent(&state, &agent);
+                        let _ = docker.remove(&agent.container_name).await;
                     }
                 }
-                "native" => {
-                    // Kill process + remove log file
-                    if let Ok(tmpl) = template::load_template(&agent.template) {
-                        stop_native_agent_process(&state, &agent, tmpl.runtime.start_cmd.as_deref()).await;
-                    }
-                    let log_path = native_log_path(&agent.container_name);
-                    let pid_path = native_pid_path(&agent.container_name);
-                    let _ = state.vm.shell_run(&format!("rm -f {log_path} {pid_path}")).await;
-                }
-                _ => {
-                    let docker = state.docker.read().await;
-                    let _ = docker.remove(&agent.container_name).await;
-                }
+            } else {
+                let _ = vm.delete().await;
             }
         };
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), cleanup).await;
@@ -1146,15 +1403,14 @@ pub async fn apply_agent_config(
 ) -> Result<(), String> {
     check_vm_ready(&state)?;
 
-    let agent: AgentInfo = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE id = ?"
-    )
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
     .bind(&id)
     .fetch_one(&state.db)
     .await
     .map_err(|e| e.to_string())?;
+
+    let vm = vm_for_agent(&state, &agent);
+    vm.ensure_ready(None).await.map_err(|e| e.to_string())?;
 
     // Get real config values (not masked)
     let configs: Vec<AgentConfigEntry> = sqlx::query_as(
@@ -1258,13 +1514,13 @@ pub async fn apply_agent_config(
             let openclaw_state = openclaw_state_dir(&agent.container_name);
             let openclaw_home = openclaw_home_dir(&agent.container_name);
             let openclaw_exports = openclaw_shell_exports(&agent.container_name);
-            state.vm.shell_run(&format!(
+            vm.shell_run(&format!(
                 "mkdir -p {} {}",
                 openclaw_home,
                 openclaw_state,
             )).await.map_err(|e| e.to_string())?;
 
-            upsert_openclaw_auth_profile(&state, &agent.container_name, provider_id, &api_key).await?;
+            upsert_openclaw_auth_profile(&state, &agent, provider_id, &api_key).await?;
 
             // Write instance-specific OpenClaw .env with the API key + gateway token
             let mut dotenv_content = format!("{}={}", env_var_name, api_key);
@@ -1301,7 +1557,7 @@ pub async fn apply_agent_config(
                 dotenv_content.replace('\'', "'\\''")
                 ,state_dir = openclaw_state
             );
-            let _ = state.vm.shell_run(&write_env_cmd).await;
+            let _ = vm.shell_run(&write_env_cmd).await;
             tracing::info!("Wrote instance OpenClaw .env with {}", env_var_name);
 
             // Run openclaw onboard to generate openclaw.json
@@ -1394,7 +1650,7 @@ pub async fn apply_agent_config(
 
             let full_onboard = format!("bash -c '{}'", onboard_cmd.replace('\'', "'\\''"));
             tracing::info!("Running OpenClaw onboard for provider={}", provider);
-            match state.vm.shell_run(&full_onboard).await {
+            match vm.shell_run(&full_onboard).await {
                 Ok(output) => tracing::info!("OpenClaw onboard completed: {}", output.chars().take(200).collect::<String>()),
                 Err(e) => tracing::warn!("OpenClaw onboard failed (non-fatal): {}", e),
             }
@@ -1403,7 +1659,7 @@ pub async fn apply_agent_config(
                 "export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports} openclaw models set '{}' 2>/dev/null || true",
                 desired_model.replace('\'', "'\\''")
             );
-            if let Ok(output) = state.vm.shell_run(&set_model_cmd).await {
+            if let Ok(output) = vm.shell_run(&set_model_cmd).await {
                 tracing::info!("OpenClaw models set completed: {}", output.chars().take(200).collect::<String>());
             }
         }
@@ -1422,8 +1678,8 @@ pub async fn apply_agent_config(
 
             let log_path = native_log_path(&agent.container_name);
             let pid_path = native_pid_path(&agent.container_name);
-            let _ = state.vm.shell_run(&format!("mkdir -p {} {}", native_log_dir(), native_pid_dir())).await;
-            state.vm.shell_run(&format!(": > {log_path}")).await.map_err(|e| e.to_string())?;
+            let _ = vm.shell_run(&format!("mkdir -p {} {}", native_log_dir(), native_pid_dir())).await;
+            vm.shell_run(&format!(": > {log_path}")).await.map_err(|e| e.to_string())?;
             let openclaw_exports = if agent.template == "openclaw" {
                 format!("{} ", openclaw_shell_exports(&agent.container_name))
             } else {
@@ -1433,13 +1689,13 @@ pub async fn apply_agent_config(
                 "bash -c 'export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports}export AGENTBOX_PORT={}; nohup env {env_str} {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'",
                 agent.port
             );
-            state.vm.shell_run(&run_cmd).await.map_err(|e| e.to_string())?;
+            vm.shell_run(&run_cmd).await.map_err(|e| e.to_string())?;
             tracing::info!(port = agent.port, "Native agent restarted with new config");
         }
     } else {
         // Stop, remove, and recreate container with new env vars
-        let docker = state.docker.read().await;
-        if agent.status == "RUNNING" {
+        let docker = docker_for_agent(&state, &agent);
+        if agent.status == STATUS_RUNNING {
             let _ = docker.stop(&agent.container_name).await;
         }
         let _ = docker.remove(&agent.container_name).await;
@@ -1476,7 +1732,8 @@ pub async fn apply_agent_config(
         docker.create_with_args(&config, &extra_args).await.map_err(|e| e.to_string())?;
     }
 
-    sqlx::query("UPDATE agents SET status = 'RUNNING', updated_at = datetime('now') WHERE id = ?")
+    sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(STATUS_RUNNING)
         .bind(&id)
         .execute(&state.db)
         .await
@@ -1513,11 +1770,7 @@ pub async fn get_agent_logs(
     tail: Option<u32>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let agent: AgentInfo = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE id = ?"
-    )
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
     .bind(&id)
     .fetch_one(&state.db)
     .await
@@ -1527,16 +1780,14 @@ pub async fn get_agent_logs(
         // Read log file from VM
         let n = tail.unwrap_or(100);
         let log_path = native_log_path(&agent.container_name);
-        state.vm.shell_run(&format!("tail -n {n} {log_path} 2>/dev/null || echo '(暂无日志)'"))
+        let vm = vm_for_agent(&state, &agent);
+        vm.shell_run(&format!("tail -n {n} {log_path} 2>/dev/null || echo '(暂无日志)'"))
             .await
             .map(|logs| sanitize_log_for_display(&logs))
             .map_err(|e| e.to_string())
     } else {
-        state
-            .docker
-            .read()
-            .await
-            .logs(&agent.container_name, tail.unwrap_or(100))
+        let docker = docker_for_agent(&state, &agent);
+        docker.logs(&agent.container_name, tail.unwrap_or(100))
             .await
             .map(|logs| sanitize_log_for_display(&logs))
             .map_err(|e| e.to_string())
@@ -1552,11 +1803,7 @@ pub async fn open_agent_shell(
 ) -> Result<(), String> {
     check_vm_ready(&state)?;
 
-    let agent: AgentInfo = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE id = ?"
-    )
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
     .bind(&id)
     .fetch_one(&state.db)
     .await
@@ -1564,8 +1811,9 @@ pub async fn open_agent_shell(
 
     if agent.install_method == "native" {
         // Native agents run inside the VM — open a local terminal connected to VM.
+        let vm = vm_for_agent(&state, &agent);
         if agent.template == "openclaw" {
-            if let Some(ssh_info) = state.vm.ssh_info().map_err(|e| e.to_string())? {
+            if let Some(ssh_info) = vm.ssh_info().map_err(|e| e.to_string())? {
                 #[cfg(target_os = "macos")]
                 {
                     let remote_cmd = format!(
@@ -1588,14 +1836,11 @@ pub async fn open_agent_shell(
                 }
             }
         }
-        state.vm.open_vm_shell().map_err(|e| e.to_string())?;
+        vm.open_vm_shell().map_err(|e| e.to_string())?;
         Ok(())
     } else {
-        state
-            .docker
-            .read()
-            .await
-            .open_shell(&agent.container_name, shell.as_deref())
+        let docker = docker_for_agent(&state, &agent);
+        docker.open_shell(&agent.container_name, shell.as_deref())
             .map_err(|e| e.to_string())
     }
 }
@@ -1614,17 +1859,14 @@ pub async fn run_agent_shell_command(
         return Ok(String::new());
     }
 
-    let agent: AgentInfo = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE id = ?"
-    )
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
     .bind(&id)
     .fetch_one(&state.db)
     .await
     .map_err(|e| e.to_string())?;
 
     let output = if agent.install_method == "native" {
+        let vm = vm_for_agent(&state, &agent);
         // Ensure common user bins are available for native web shell commands.
         let openclaw_exports = if agent.template == "openclaw" {
             format!("{} ", openclaw_shell_exports(&agent.container_name))
@@ -1634,13 +1876,10 @@ pub async fn run_agent_shell_command(
         let full_cmd = format!(
             "export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports}{cmd}"
         );
-        state.vm.shell_run(&full_cmd).await.map_err(|e| e.to_string())?
+        vm.shell_run(&full_cmd).await.map_err(|e| e.to_string())?
     } else {
-        state
-            .docker
-            .read()
-            .await
-            .exec_capture(&agent.container_name, cmd, shell_default_for_agent(&agent))
+        let docker = docker_for_agent(&state, &agent);
+        docker.exec_capture(&agent.container_name, cmd, shell_default_for_agent(&agent))
             .await
             .map_err(|e| e.to_string())?
     };
@@ -1654,11 +1893,7 @@ pub async fn open_agent_browser(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let agent: AgentInfo = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE id = ?"
-    )
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
     .bind(&id)
     .fetch_one(&state.db)
     .await
@@ -1670,9 +1905,10 @@ pub async fn open_agent_browser(
     // This returns the URL format expected by the Control UI, including the
     // current auth token when needed.
     if agent.template == "openclaw" {
+        let vm = vm_for_agent(&state, &agent);
         let openclaw_exports = openclaw_shell_exports(&agent.container_name);
-        let dashboard_output = state
-            .vm
+        let gateway_token = resolve_openclaw_gateway_token(&state, &agent).await;
+        let dashboard_output = vm
             .shell_run(
                 &format!(
                     "export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports} openclaw dashboard --no-open 2>/dev/null | grep -Eo 'https?://[^[:space:]]+' | tail -n 1 || true"
@@ -1688,29 +1924,8 @@ pub async fn open_agent_browser(
             }
         }
 
-        if url == format!("http://localhost:{}", agent.port) {
-            let db_token: Option<String> = sqlx::query_scalar::<_, String>(
-            "SELECT config_value FROM agent_configs WHERE agent_id = ? AND config_key = 'gateway_token'"
-            )
-            .bind(&id)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| e.to_string())?;
-
-            let config_token = state
-                .vm
-                .shell_run(&format!(
-                    "export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports} openclaw config get gateway.auth.token 2>/dev/null || true"
-                ))
-                .await
-                .ok()
-                .map(|output| output.trim().to_string())
-                .filter(|token| !token.is_empty());
-
-            let token = db_token.or(config_token);
-            if let Some(t) = token {
-                url = format!("http://localhost:{}/#token={}", agent.port, t);
-            }
+        if let Some(token) = gateway_token {
+            url = append_gateway_token_to_url(&url, &token);
         }
     }
 
@@ -1735,12 +1950,23 @@ pub struct SshConnectionInfo {
 /// Returns None for Docker-based agents.
 #[tauri::command]
 pub async fn get_ssh_info(
+    id: String,
     state: State<'_, AppState>,
 ) -> Result<Option<SshConnectionInfo>, String> {
-    // Ensure SSH config is set up
-    state.vm.ensure_ssh_config().map_err(|e| e.to_string())?;
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    let info = state.vm.ssh_info().map_err(|e| e.to_string())?;
+    if agent.install_method != "native" {
+        return Ok(None);
+    }
+
+    let vm = vm_for_agent(&state, &agent);
+    vm.ensure_ssh_config().map_err(|e| e.to_string())?;
+
+    let info = vm.ssh_info().map_err(|e| e.to_string())?;
     Ok(info.map(|i| SshConnectionInfo {
         host: i.host,
         config_file: i.config_file,
@@ -1756,9 +1982,7 @@ pub async fn get_ssh_info(
 /// Auto-start all agents that have `auto_start = true`.
 pub async fn autostart_agents(state: &AppState) -> Result<(), String> {
     let agents: Vec<AgentInfo> = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE auto_start = 1 AND status != 'RUNNING'"
+        "SELECT * FROM agents WHERE auto_start = 1 AND status != 'RUNNING'"
     )
     .fetch_all(&state.db)
     .await
@@ -1766,6 +1990,25 @@ pub async fn autostart_agents(state: &AppState) -> Result<(), String> {
 
     for agent in agents {
         tracing::info!(id = %agent.id, name = %agent.name, "Auto-starting agent");
+        sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
+            .bind(STATUS_STARTING)
+            .bind(&agent.id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let vm = vm_for_agent(state, &agent);
+        if let Err(e) = vm.ensure_ready(None).await {
+            tracing::error!(id = %agent.id, error = %e, "Failed to prepare agent VM for auto-start");
+            sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
+                .bind(STATUS_START_FAILED)
+                .bind(&agent.id)
+                .execute(&state.db)
+                .await
+                .map_err(|db_err| db_err.to_string())?;
+            continue;
+        }
+
         let result = match agent.install_method.as_str() {
             "compose" => {
                 let tmpl = template::load_template(&agent.template);
@@ -1774,7 +2017,7 @@ pub async fn autostart_agents(state: &AppState) -> Result<(), String> {
                         let compose_file = t.runtime.compose_file.as_deref().unwrap_or("docker-compose.yml");
                         let template_dir = template::templates_dir().join(&agent.template);
                         let compose_path = template_dir.join(compose_file);
-                        let docker = state.docker.read().await;
+                        let docker = docker_for_agent(state, &agent);
                         match docker.compose(
                             &["-f", &compose_path.to_string_lossy(), "-p", &agent.container_name, "start"],
                             &[],
@@ -1793,8 +2036,8 @@ pub async fn autostart_agents(state: &AppState) -> Result<(), String> {
                         if let Some(start_cmd) = tmpl.runtime.start_cmd.as_deref() {
                             let log_path = native_log_path(&agent.container_name);
                             let pid_path = native_pid_path(&agent.container_name);
-                            let _ = state.vm.shell_run(&format!("mkdir -p {} {}", native_log_dir(), native_pid_dir())).await;
-                            let _ = state.vm.shell_run(&format!(": > {log_path}")).await;
+                            let _ = vm.shell_run(&format!("mkdir -p {} {}", native_log_dir(), native_pid_dir())).await;
+                            let _ = vm.shell_run(&format!(": > {log_path}")).await;
 
                             // For openclaw: inject gateway token env var
                             let mut extra_env = String::new();
@@ -1802,7 +2045,7 @@ pub async fn autostart_agents(state: &AppState) -> Result<(), String> {
                             if agent.template == "openclaw" {
                                 let openclaw_home = openclaw_home_dir(&agent.container_name);
                                 let openclaw_state = openclaw_state_dir(&agent.container_name);
-                                let _ = state.vm.shell_run(&format!(
+                                let _ = vm.shell_run(&format!(
                                     "mkdir -p {} {}",
                                     openclaw_home,
                                     openclaw_state,
@@ -1824,7 +2067,7 @@ pub async fn autostart_agents(state: &AppState) -> Result<(), String> {
                                 "bash -c 'export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports}export AGENTBOX_PORT={}; {extra_env}nohup {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'",
                                 agent.port
                             );
-                            match state.vm.shell_run(&run_cmd).await {
+                            match vm.shell_run(&run_cmd).await {
                                 Ok(_) => {
                                     tracing::info!(port = agent.port, "Native agent auto-started — Lima auto-forwards port");
                                     Ok(())
@@ -1838,12 +2081,13 @@ pub async fn autostart_agents(state: &AppState) -> Result<(), String> {
                     Err(e) => Err(e),
                 }
             }
-            _ => state.docker.read().await.start(&agent.container_name).await,
+            _ => docker_for_agent(state, &agent).start(&agent.container_name).await,
         };
 
         match result {
             Ok(()) => {
-                sqlx::query("UPDATE agents SET status = 'RUNNING', updated_at = datetime('now') WHERE id = ?")
+                sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
+                    .bind(STATUS_RUNNING)
                     .bind(&agent.id)
                     .execute(&state.db)
                     .await
@@ -1851,7 +2095,8 @@ pub async fn autostart_agents(state: &AppState) -> Result<(), String> {
             }
             Err(e) => {
                 tracing::error!(id = %agent.id, error = %e, "Failed to auto-start agent");
-                sqlx::query("UPDATE agents SET status = 'ERROR', updated_at = datetime('now') WHERE id = ?")
+                sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
+                    .bind(STATUS_START_FAILED)
                     .bind(&agent.id)
                     .execute(&state.db)
                     .await
@@ -1884,11 +2129,7 @@ pub async fn export_agent_data(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let agent: AgentInfo = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE id = ?"
-    )
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
     .bind(&id)
     .fetch_one(&state.db)
     .await
@@ -1904,11 +2145,7 @@ pub async fn import_agent_data(
     backup_path: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let agent: AgentInfo = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE id = ?"
-    )
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
     .bind(&id)
     .fetch_one(&state.db)
     .await
@@ -2036,21 +2273,21 @@ pub async fn upgrade_agent(
     check_vm_ready(&state)?;
 
     // Reject if another agent is already being provisioned
-    let creating_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agents WHERE status = 'CREATING'"
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    if state.provisioning_count.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        return Err("已有实例正在创建中，请等待完成后再升级".into());
+    }
+
+    let creating_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents WHERE status = 'CREATING'")
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
     if creating_count > 0 {
         return Err("已有实例正在创建中，请等待完成后再升级".into());
     }
 
-    let old_agent: AgentInfo = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE id = ?"
-    )
+    let provisioning_guard = ProvisioningCounterGuard::new(state.provisioning_count.clone());
+
+    let old_agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
     .bind(&id)
     .fetch_one(&state.db)
     .await
@@ -2061,7 +2298,7 @@ pub async fn upgrade_agent(
     tracing::info!(agent_id = %id, backup = %backup_path, "Exported agent data for upgrade");
 
     // 2. Stop old agent
-    if old_agent.status == "RUNNING" {
+    if old_agent.status == STATUS_RUNNING {
         let _ = stop_agent_internal(&old_agent, &state).await;
     }
 
@@ -2080,7 +2317,8 @@ pub async fn upgrade_agent(
 
     let base_port = tmpl.ports.first().map(|p| p.host).unwrap_or(3000);
     let port = find_available_port(&state.db, base_port).await?;
-    let container_name = format!("agentbox-{}-{}", old_agent.template, instance_no);
+    let vm_name = vm_name_for_instance(&old_agent.template, instance_no);
+    let container_name = vm_name.clone();
     let health_url = tmpl.health.url.replace(
         &format!(":{}", tmpl.ports.first().map(|p| p.container).unwrap_or(0)),
         &format!(":{port}"),
@@ -2091,8 +2329,8 @@ pub async fn upgrade_agent(
 
     sqlx::query(
         "INSERT INTO agents (id, name, template, instance_no, port, status, health_url,
-                             version, install_method, container_name, auto_start, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'CREATING', ?, ?, ?, ?, ?, ?, ?)"
+                            version, install_method, container_name, vm_name, auto_start, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 'CREATING', ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&new_id).bind(&old_agent.name).bind(&old_agent.template)
     .bind(instance_no).bind(port)
@@ -2100,6 +2338,7 @@ pub async fn upgrade_agent(
     .bind(&tmpl.version)
     .bind(&tmpl.install_method)
     .bind(&container_name)
+        .bind(&vm_name)
     .bind(old_agent.auto_start)
     .bind(&now).bind(&now)
     .execute(&state.db)
@@ -2107,11 +2346,10 @@ pub async fn upgrade_agent(
     .map_err(|e| e.to_string())?;
 
     // 4. Provision new container and import data in background
-    let docker = state.docker.clone();
-    let vm = state.vm.clone();
     let db = state.db.clone();
     let new_agent_id = new_id.clone();
     let c_name = container_name.clone();
+        let vm_name_clone = vm_name.clone();
     let old_agent_clone = old_agent.clone();
     let backup_path_clone = backup_path.clone();
     let new_health_url = health_url.clone();
@@ -2120,20 +2358,26 @@ pub async fn upgrade_agent(
     let ret_version_ret = ret_version.clone();
     let ret_install_method_ret = ret_install_method.clone();
     let prov_lock = state.provisioning_lock.clone();
+    let prov_count = provisioning_guard.release_to_spawn();
 
     tauri::async_runtime::spawn(async move {
         let _guard = prov_lock.lock().await;
-        let docker_guard = docker.read().await;
+        let docker = app_state.docker_for_vm_name(&vm_name_clone);
+        let vm = app_state.vm_for_name(&vm_name_clone);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30 * 60),
-            provision_agent(&docker_guard, &vm, &tmpl, &c_name, port, &db, &new_agent_id),
+            provision_agent(&app_state, &docker, &vm, &tmpl, &c_name, port, &db, &new_agent_id),
         ).await;
         let result = match result {
             Ok(r) => r,
             Err(_) => Err(anyhow::anyhow!("升级超时（超过30分钟），请删除后重试")),
         };
+        let cancelled = provisioning_cancelled_or_deleted(&app_state, &new_agent_id).await;
         match result {
             Ok(prov) => {
+                if cancelled {
+                    let _ = vm.delete().await;
+                } else {
                 let _ = sqlx::query(
                     "INSERT INTO agent_configs (agent_id, config_key, config_value, is_secret, updated_at) \
                      SELECT ?, config_key, config_value, is_secret, datetime('now') FROM agent_configs WHERE agent_id = ?"
@@ -2149,20 +2393,21 @@ pub async fn upgrade_agent(
                     template: old_agent_clone.template.clone(),
                     instance_no,
                     port,
-                    status: "CREATING".into(),
+                    status: STATUS_CREATING.into(),
                     auto_start: old_agent_clone.auto_start,
                     health_url: Some(new_health_url.clone()),
                     created_at: now.clone(),
                     version: ret_version.clone(),
                     install_method: ret_install_method.clone(),
                     container_name: c_name.clone(),
+                    vm_name: vm_name_clone.clone(),
                 };
 
                 if let Err(e) = restore_backup_into_agent_internal(&new_agent_for_import, &backup_path_clone, &app_state, false).await {
                     tracing::warn!(agent_id = %new_agent_id, error = %e, "Failed to import backup into upgraded agent");
                 }
 
-                let new_status = if prov.needs_manual_install { "STOPPED" } else { "RUNNING" };
+                let new_status = if prov.needs_manual_install { STATUS_CREATE_FAILED } else { STATUS_RUNNING };
                 let _ = sqlx::query(
                     "UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?"
                 )
@@ -2170,23 +2415,34 @@ pub async fn upgrade_agent(
                 .bind(&new_agent_id)
                 .execute(&db)
                 .await;
+                }
             }
             Err(e) => {
-                tracing::error!(agent_id = %new_agent_id, error = %e, "Failed to provision upgrade");
-                let _ = sqlx::query(
-                    "UPDATE agents SET status = 'ERROR', updated_at = datetime('now') WHERE id = ?"
-                )
-                .bind(&new_agent_id)
-                .execute(&db)
-                .await;
+                if cancelled {
+                    let _ = vm.delete().await;
+                    tracing::info!(agent_id = %new_agent_id, "Provisioning cancelled while upgrade create was in progress");
+                } else {
+                    tracing::error!(agent_id = %new_agent_id, error = %e, "Failed to provision upgrade");
+                    let _ = sqlx::query(
+                        "UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?"
+                    )
+                    .bind(STATUS_CREATE_FAILED)
+                    .bind(&new_agent_id)
+                    .execute(&db)
+                    .await;
+                }
             }
         }
+
+        app_state.clear_provisioning_cancel(&new_agent_id).await;
+        prov_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     });
 
     // 5. Mark old agent as archived
     sqlx::query(
-        "UPDATE agents SET status = 'STOPPED', name = name || ' (旧)', updated_at = datetime('now') WHERE id = ?"
+        "UPDATE agents SET status = ?, name = name || ' (旧)', updated_at = datetime('now') WHERE id = ?"
     )
+    .bind(STATUS_PENDING)
     .bind(&id)
     .execute(&state.db)
     .await
@@ -2198,13 +2454,14 @@ pub async fn upgrade_agent(
         template: old_agent.template,
         instance_no,
         port,
-        status: "CREATING".into(),
+        status: STATUS_CREATING.into(),
         auto_start: old_agent.auto_start,
         health_url: Some(health_url),
         created_at: now_ret,
         version: ret_version_ret,
         install_method: ret_install_method_ret,
         container_name,
+        vm_name,
     })
 }
 
@@ -2313,7 +2570,7 @@ async fn stop_agent_internal(agent: &AgentInfo, state: &AppState) -> Result<(), 
             let template_dir = template::templates_dir().join(&agent.template);
             let compose_path = template_dir.join(compose_file);
 
-            let docker = state.docker.read().await;
+            let docker = docker_for_agent(state, agent);
             let _ = docker.compose(
                 &["-f", &compose_path.to_string_lossy(), "-p", &agent.container_name, "stop"],
                 &[],
@@ -2324,11 +2581,13 @@ async fn stop_agent_internal(agent: &AgentInfo, state: &AppState) -> Result<(), 
             stop_native_agent_process(state, agent, tmpl.runtime.start_cmd.as_deref()).await;
         }
         _ => {
-            let _ = state.docker.read().await.stop(&agent.container_name).await;
+            let docker = docker_for_agent(state, agent);
+            let _ = docker.stop(&agent.container_name).await;
         }
     }
 
-    sqlx::query("UPDATE agents SET status = 'STOPPED', updated_at = datetime('now') WHERE id = ?")
+    sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
+        .bind(STATUS_PENDING)
         .bind(&agent.id)
         .execute(&state.db)
         .await
@@ -2343,15 +2602,15 @@ async fn export_native_openclaw_data(
     staging_dir: &std::path::Path,
 ) -> Result<(), String> {
     let target_dir = staging_dir.join(".openclaw");
+    let vm = vm_for_agent(state, agent);
 
-    if state.vm.docker_cmd_prefix().is_empty() {
+    if vm.docker_cmd_prefix().is_empty() {
         let host_state_dir = openclaw_host_home_dir(&agent.container_name)?.join(".openclaw");
         copy_dir_contents(&host_state_dir, &target_dir).map_err(|e| e.to_string())?;
         return Ok(());
     }
 
-    let ssh_info = state
-        .vm
+    let ssh_info = vm
         .ssh_info()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "当前平台暂不支持导出原生 OpenClaw 备份，请先在 macOS/Linux 验证".to_string())?;
@@ -2389,8 +2648,9 @@ async fn import_native_openclaw_data(
     let vm_tmp_archive = format!("/tmp/{archive_name}");
     let openclaw_home = openclaw_home_dir(&agent.container_name);
     let openclaw_state = openclaw_state_dir(&agent.container_name);
+    let vm = vm_for_agent(state, agent);
 
-    if state.vm.docker_cmd_prefix().is_empty() {
+    if vm.docker_cmd_prefix().is_empty() {
         let host_state_dir = dirs_next::home_dir()
             .ok_or_else(|| "无法确定主目录".to_string())?
             .join(".agentbox")
@@ -2421,10 +2681,9 @@ async fn import_native_openclaw_data(
         return Ok(());
     }
 
-    state
-        .vm
+    vm
         .provider()
-        .copy_into(agentbox_vm::VM_NAME, backup_path, &vm_tmp_archive)
+        .copy_into(vm.name(), backup_path, &vm_tmp_archive)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -2434,7 +2693,7 @@ async fn import_native_openclaw_data(
         openclaw_state = openclaw_state,
         vm_tmp_archive = shell_escape(&vm_tmp_archive),
     );
-    state.vm.shell_run(&restore_cmd).await.map_err(|e| e.to_string())?;
+    vm.shell_run(&restore_cmd).await.map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -2555,8 +2814,9 @@ fn shell_default_for_agent(_agent: &AgentInfo) -> Option<&'static str> {
 fn pty_command_for_agent(agent: &AgentInfo, state: &AppState) -> Vec<String> {
     if agent.install_method == "native" {
         let openclaw_home = openclaw_home_dir(&agent.container_name);
+        let vm = vm_for_agent(state, agent);
         // Open a shell inside the VM
-        let prefix = state.vm.docker_cmd_prefix();
+        let prefix = vm.docker_cmd_prefix();
         if prefix.is_empty() {
             // Linux: direct local shell
             if agent.template == "openclaw" {
@@ -2577,19 +2837,20 @@ fn pty_command_for_agent(agent: &AgentInfo, state: &AppState) -> Vec<String> {
                 vec![
                     limactl.clone(),
                     "shell".into(),
-                    agentbox_vm::VM_NAME.into(),
+                    agent.vm_name.clone(),
                     "--".into(),
                     "env".into(),
                     format!("OPENCLAW_HOME={openclaw_home}"),
                     "/bin/bash".into(),
                 ]
             } else {
-                vec![limactl.clone(), "shell".into(), agentbox_vm::VM_NAME.into()]
+                vec![limactl.clone(), "shell".into(), agent.vm_name.clone()]
             }
         }
     } else {
         // Docker container: docker exec -it <container> /bin/sh
-        let prefix = state.vm.docker_cmd_prefix();
+        let docker = docker_for_agent(state, agent);
+        let prefix = docker.cmd_prefix();
         let mut cmd: Vec<String> = Vec::new();
         if prefix.is_empty() {
             cmd.push("docker".into());
@@ -2600,7 +2861,7 @@ fn pty_command_for_agent(agent: &AgentInfo, state: &AppState) -> Vec<String> {
             let limactl = &prefix[0];
             cmd.push(limactl.clone());
             cmd.push("shell".into());
-            cmd.push(agentbox_vm::VM_NAME.into());
+            cmd.push(agent.vm_name.clone());
             cmd.push("--".into());
             cmd.push("docker".into());
         }
@@ -2627,11 +2888,7 @@ pub async fn pty_spawn(
 ) -> Result<(), String> {
     check_vm_ready(&state)?;
 
-    let agent: AgentInfo = sqlx::query_as(
-        "SELECT id, name, template, instance_no, port, status, auto_start, health_url,
-                created_at, version, install_method, container_name
-         FROM agents WHERE id = ?"
-    )
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
     .bind(&agent_id)
     .fetch_one(&state.db)
     .await
