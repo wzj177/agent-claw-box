@@ -154,7 +154,8 @@ cd apps/desktop && pnpm test     # 前端测试
 ## 文档
 
 - [使用指南](docs/GUIDE.md)
-- [开发文档](docs/develop/)（内部）
+- [软件截图](https://github.com/wzj177/agent-claw-box/wiki/Preview#%E6%95%88%E6%9E%9C%E5%9B%BE)
+-
 
 ## License
 
