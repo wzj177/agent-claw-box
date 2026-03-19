@@ -197,6 +197,12 @@ pub async fn reconcile_agent_statuses(state: &AppState) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     for agent in agents {
+        // Provisioning may take minutes for native templates. During that window
+        // the port is expected to be closed, so skip reconciliation entirely.
+        if agent.status == "CREATING" {
+            continue;
+        }
+
         if let Some(actual_status) = reconcile_agent_runtime_status(state, &agent).await {
             if agent.status != actual_status {
                 sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
