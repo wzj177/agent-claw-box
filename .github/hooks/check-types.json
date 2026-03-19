@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "type": "command",
+        "command": "cd apps/desktop && pnpm exec tsc --noEmit 2>&1 | head -30",
+        "timeout": 30
+      }
+    ]
+  }
+}
