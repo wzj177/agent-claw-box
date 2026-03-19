@@ -71,7 +71,16 @@ pub fn run() {
                     }
                 }
 
-                // 1.5 Reconcile persisted statuses against the actual runtime.
+                // 1.5 Recover interrupted in-flight states from previous app processes,
+                // then normalize legacy statuses and reconcile against actual runtime.
+                if let Err(e) = commands::recover_interrupted_agent_statuses(&state_clone).await {
+                    tracing::warn!("Failed to recover interrupted agent statuses: {e}");
+                }
+
+                if let Err(e) = commands::normalize_agent_statuses(&state_clone).await {
+                    tracing::warn!("Failed to normalize agent statuses: {e}");
+                }
+
                 if let Err(e) = commands::reconcile_agent_statuses(&state_clone).await {
                     tracing::warn!("Failed to reconcile agent statuses: {e}");
                 }
@@ -82,7 +91,7 @@ pub fn run() {
                 }
 
                 // 3. Start metrics collection
-                metrics::spawn_collector(state_clone.db.clone(), state_clone.docker.clone(), 30);
+                metrics::spawn_collector(state_clone.clone(), 30);
             });
 
             app.manage(state);

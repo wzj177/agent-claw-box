@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for AgentBox desktop app",
+  "description": "Default capability for AgentClawBox desktop app",
   "windows": ["main"],
   "permissions": [
     "core:default",
