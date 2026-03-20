@@ -1364,11 +1364,15 @@ pub async fn stop_agent(id: String, state: State<'_, AppState>) -> Result<(), St
 /// Delete an agent and its container.
 #[tauri::command]
 pub async fn delete_agent(id: String, state: State<'_, AppState>) -> Result<(), String> {
-    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
-    .bind(&id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+    let Some(agent): Option<AgentInfo> = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        // Already deleted (or never existed) — treat as success for idempotency.
+        return Ok(());
+    };
 
     if agent.status == STATUS_CREATING {
         state.request_provisioning_cancel(&id).await;
@@ -1413,7 +1417,9 @@ pub async fn delete_agent(id: String, state: State<'_, AppState>) -> Result<(), 
                 let _ = vm.delete().await;
             }
         };
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), cleanup).await;
+        if let Err(e) = tokio::time::timeout(std::time::Duration::from_secs(10), cleanup).await {
+            tracing::warn!(agent_id = %id, error = ?e, "Delete cleanup timed out, continue removing DB record");
+        }
     }
 
     // Remove DB record (cascades to agent_configs and agent_metrics)
