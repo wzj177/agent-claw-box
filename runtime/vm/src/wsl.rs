@@ -28,11 +28,31 @@ impl WslProvider {
             .context("Failed to run wsl.exe")?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = Self::decode_windows_output(&output.stderr);
             anyhow::bail!("wsl {} failed: {}", args.join(" "), stderr);
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(Self::decode_windows_output(&output.stdout).trim().to_string())
+    }
+
+    fn decode_windows_output(bytes: &[u8]) -> String {
+        let odd_nul_count = bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|&&b| b == 0)
+            .count();
+        let looks_utf16 = bytes.len() >= 4 && odd_nul_count > bytes.len() / 8;
+
+        if looks_utf16 {
+            let mut u16s = Vec::with_capacity(bytes.len() / 2);
+            for chunk in bytes.chunks_exact(2) {
+                u16s.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+            }
+            String::from_utf16_lossy(&u16s)
+        } else {
+            String::from_utf8_lossy(bytes).to_string()
+        }
     }
 
     /// Run a command inside the WSL distro.
@@ -44,11 +64,11 @@ impl WslProvider {
             .context("Failed to run command in WSL")?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = Self::decode_windows_output(&output.stderr);
             anyhow::bail!("WSL command failed: {stderr}");
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        Ok(Self::decode_windows_output(&output.stdout).trim().to_string())
     }
 
     /// Check if a named distro exists in wsl --list output.
@@ -194,8 +214,8 @@ impl WslProvider {
             .context("导入 fallback Ubuntu 到实例失败")?;
 
         if !import.status.success() {
-            let stderr = String::from_utf8_lossy(&import.stderr);
-            let stdout = String::from_utf8_lossy(&import.stdout);
+            let stderr = Self::decode_windows_output(&import.stderr);
+            let stdout = Self::decode_windows_output(&import.stdout);
             let _ = Self::run_wsl(&["--unregister", name]).await;
             anyhow::bail!("导入 fallback Ubuntu 到实例失败:\nstdout: {stdout}\nstderr: {stderr}");
         }
@@ -294,8 +314,8 @@ impl VmProvider for WslProvider {
                 .context("Failed to import WSL distro")?;
 
             if !import.status.success() {
-                let stderr = String::from_utf8_lossy(&import.stderr);
-                let stdout = String::from_utf8_lossy(&import.stdout);
+                let stderr = Self::decode_windows_output(&import.stderr);
+                let stdout = Self::decode_windows_output(&import.stdout);
                 let _ = Self::run_wsl(&["--unregister", &config.name]).await;
                 let lower = format!("{}\n{}", stdout, stderr).to_lowercase();
                 if lower.contains("hcs_e_hyperv_not_installed")

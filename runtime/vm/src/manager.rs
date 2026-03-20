@@ -37,6 +37,28 @@ pub enum SetupStage {
 }
 
 impl VmManager {
+    #[cfg(target_os = "windows")]
+    fn decode_windows_output(bytes: &[u8]) -> String {
+        // Some Windows CLIs return UTF-16LE. Detect by frequent NUL bytes in odd positions.
+        let odd_nul_count = bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|&&b| b == 0)
+            .count();
+        let looks_utf16 = bytes.len() >= 4 && odd_nul_count > bytes.len() / 8;
+
+        if looks_utf16 {
+            let mut u16s = Vec::with_capacity(bytes.len() / 2);
+            for chunk in bytes.chunks_exact(2) {
+                u16s.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+            }
+            String::from_utf16_lossy(&u16s)
+        } else {
+            String::from_utf8_lossy(bytes).to_string()
+        }
+    }
+
     /// Create a new VmManager with the platform-appropriate provider.
     pub fn new(config: VmConfig) -> Self {
         let (provider, runtime_notice) = Self::detect_provider();
@@ -84,9 +106,9 @@ impl VmManager {
                 .ok()
                 .map(|o| {
                     let mut all = String::new();
-                    all.push_str(&String::from_utf8_lossy(&o.stdout));
+                    all.push_str(&Self::decode_windows_output(&o.stdout));
                     all.push('\n');
-                    all.push_str(&String::from_utf8_lossy(&o.stderr));
+                    all.push_str(&Self::decode_windows_output(&o.stderr));
                     let lower = all.to_lowercase();
 
                     // 典型不可用场景：HCS_E_HYPERV_NOT_INSTALLED / 提示开启虚拟化
