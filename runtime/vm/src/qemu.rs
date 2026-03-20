@@ -205,21 +205,18 @@ impl QemuProvider {
         );
         let mut child = tokio::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
             .spawn()
             .context("PowerShell 下载失败")?;
 
-        let output = match tokio::time::timeout(Duration::from_secs(10 * 60), child.wait_with_output()).await {
+        let status = match tokio::time::timeout(Duration::from_secs(10 * 60), child.wait()).await {
             Ok(result) => result.context("PowerShell 下载失败")?,
             Err(_) => {
                 let _ = child.kill().await;
                 anyhow::bail!("下载超时（超过10分钟），请检查网络或在部署时选择本地 ISO 文件");
             }
         };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("下载失败: {stderr}");
+        if !status.success() {
+            anyhow::bail!("下载失败（PowerShell 返回非 0 状态）");
         }
         info!("下载完成: {}", dest.display());
         Ok(())

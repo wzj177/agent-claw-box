@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { Download, Search, Cpu, HardDrive, MemoryStick } from "lucide-react";
+import { Download, Search, Cpu, HardDrive, MemoryStick, FolderOpen } from "lucide-react";
 import { api, type TemplateInfo, type SystemInfo, type CreateAgentOptions } from "../lib/api";
 import { useNavigate } from "react-router-dom";
+import { open } from "@tauri-apps/plugin-dialog";
 
 const INSTALL_METHOD_LABELS: Record<string, string> = {
   docker: "Docker 镜像",
@@ -93,6 +94,17 @@ export function MarketplacePage() {
     const template = deployDialog;
     setDeployDialog(null);
     await handleDeploy(template, opts);
+  };
+
+  const pickIsoFile = async () => {
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      filters: [{ name: "ISO 镜像", extensions: ["iso"] }],
+    });
+    if (typeof selected === "string") {
+      setQemuIsoPath(selected);
+    }
   };
 
   return (
@@ -240,13 +252,19 @@ export function MarketplacePage() {
             {(runtimeMode === "qemu" || runtimeMode === "auto") && (
               <div className="space-y-2">
                 <label className="block text-caption text-neutral-600">QEMU 本地 ISO 文件（可选）</label>
-                <input
-                  type="text"
-                  value={qemuIsoPath}
-                  onChange={(e) => setQemuIsoPath(e.target.value)}
-                  placeholder="例如: C:\\Users\\admin\\Downloads\\alpine-virt.iso"
-                  className="w-full px-3 py-2 text-body bg-white border border-neutral-300 rounded-md focus:outline-none focus:border-primary-400 focus:ring-1 focus:ring-primary-100"
-                />
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={qemuIsoPath}
+                    onChange={(e) => setQemuIsoPath(e.target.value)}
+                    placeholder="例如: C:\\Users\\admin\\Downloads\\alpine-virt.iso"
+                    className="flex-1 px-3 py-2 text-body bg-white border border-neutral-300 rounded-md focus:outline-none focus:border-primary-400 focus:ring-1 focus:ring-primary-100"
+                  />
+                  <button type="button" onClick={pickIsoFile} className="btn-default" title="选择 ISO 文件">
+                    <FolderOpen className="w-3.5 h-3.5" />
+                    选择
+                  </button>
+                </div>
                 <p className="text-caption text-neutral-400">
                   不填则自动下载（最长等待 10 分钟）；填写后将优先使用本地 ISO，避免慢速下载。
                 </p>
