@@ -297,6 +297,15 @@ impl VmProvider for WslProvider {
                 let stderr = String::from_utf8_lossy(&import.stderr);
                 let stdout = String::from_utf8_lossy(&import.stdout);
                 let _ = Self::run_wsl(&["--unregister", &config.name]).await;
+                let lower = format!("{}\n{}", stdout, stderr).to_lowercase();
+                if lower.contains("hcs_e_hyperv_not_installed")
+                    || lower.contains("enablevirtualization")
+                    || lower.contains("registerdistro/createvm")
+                {
+                    anyhow::bail!(
+                        "WSL2 无法创建虚拟机（缺少 Hyper-V / 未开启 BIOS 虚拟化）。\n请二选一：\n1) 在 BIOS 启用 VT-x/AMD-V 并开启 Windows 虚拟化组件后重试；\n2) 直接使用 QEMU 模式（无需 WSL）。\n原始输出:\nstdout: {stdout}\nstderr: {stderr}"
+                    );
+                }
                 anyhow::bail!("WSL import failed:\nstdout: {stdout}\nstderr: {stderr}");
             }
 

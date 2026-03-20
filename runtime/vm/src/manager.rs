@@ -18,6 +18,7 @@ pub const VM_NAME: &str = "agentbox";
 pub struct VmManager {
     provider: Arc<dyn VmProvider>,
     config: VmConfig,
+    runtime_notice: Option<String>,
 }
 
 /// Progress callback type for UI updates during setup.
@@ -38,9 +39,11 @@ pub enum SetupStage {
 impl VmManager {
     /// Create a new VmManager with the platform-appropriate provider.
     pub fn new(config: VmConfig) -> Self {
+        let (provider, runtime_notice) = Self::detect_provider();
         Self {
-            provider: Self::detect_provider(),
+            provider,
             config,
+            runtime_notice,
         }
     }
 
@@ -61,31 +64,62 @@ impl VmManager {
     }
 
     /// Detect the correct VM provider for the current platform.
-    fn detect_provider() -> Arc<dyn VmProvider> {
+    fn detect_provider() -> (Arc<dyn VmProvider>, Option<String>) {
         #[cfg(target_os = "macos")]
         {
-            Arc::new(crate::lima::LimaProvider::new())
+            (Arc::new(crate::lima::LimaProvider::new()), None)
         }
         #[cfg(target_os = "windows")]
         {
-            // 优先使用 WSL2；若系统未启用 WSL，降级到 QEMU（适用于 Windows Home
-            // 以及禁用 Hyper-V 的企业环境）。
-            let wsl_available = std::process::Command::new("wsl.exe")
+            // 优先使用 WSL2；若系统未启用 WSL 或缺少 Hyper-V/虚拟化能力，降级到 QEMU。
+            let wsl_installed = std::process::Command::new("wsl.exe")
                 .arg("--version")
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false);
-            if wsl_available {
+
+            let wsl_can_create_vm = std::process::Command::new("wsl.exe")
+                .arg("--status")
+                .output()
+                .ok()
+                .map(|o| {
+                    let mut all = String::new();
+                    all.push_str(&String::from_utf8_lossy(&o.stdout));
+                    all.push('\n');
+                    all.push_str(&String::from_utf8_lossy(&o.stderr));
+                    let lower = all.to_lowercase();
+
+                    // 典型不可用场景：HCS_E_HYPERV_NOT_INSTALLED / 提示开启虚拟化
+                    let hyperv_missing = lower.contains("hcs_e_hyperv_not_installed")
+                        || lower.contains("enablevirtualization")
+                        || lower.contains("registerdistro/createvm");
+
+                    o.status.success() && !hyperv_missing
+                })
+                .unwrap_or(false);
+
+            if wsl_installed && wsl_can_create_vm {
                 tracing::info!("Windows 运行时：使用 WSL2 提供者");
-                Arc::new(crate::wsl::WslProvider::new())
+                (
+                    Arc::new(crate::wsl::WslProvider::new()),
+                    Some("当前运行模式：WSL2（默认）".to_string()),
+                )
             } else {
-                tracing::info!("Windows 运行时：WSL2 不可用，降级到 QEMU 提供者");
-                Arc::new(crate::qemu::QemuProvider::new())
+                tracing::info!(
+                    "Windows 运行时：WSL2 不可用于创建虚拟机（可能缺少 Hyper-V/虚拟化），降级到 QEMU 提供者"
+                );
+                (
+                    Arc::new(crate::qemu::QemuProvider::new()),
+                    Some(
+                        "检测到 WSL2 当前不可用于创建虚拟机，已自动切换到 QEMU 模式（无需 WSL）"
+                            .to_string(),
+                    ),
+                )
             }
         }
         #[cfg(target_os = "linux")]
         {
-            Arc::new(crate::native::NativeProvider::new())
+            (Arc::new(crate::native::NativeProvider::new()), None)
         }
     }
 
@@ -129,6 +163,10 @@ impl VmManager {
                 f(msg);
             }
         };
+
+        if let Some(notice) = &self.runtime_notice {
+            report(notice);
+        }
 
         report("检查运行环境...");
         if !self.provider.is_runtime_installed().await {
