@@ -5,6 +5,7 @@
 //! and installs Docker inside.
 
 use anyhow::{Context, Result};
+use std::path::Path;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{info, warn};
 
@@ -161,7 +162,14 @@ impl WslProvider {
             .await
             .ok_or_else(|| anyhow::anyhow!("未检测到可导出的 Ubuntu 发行版，请先手动执行 wsl --install -d Ubuntu-22.04"))?;
 
-        let export_tar = format!("{}\\ubuntu-2204-export.tar", install_dir);
+        let parent_dir = Path::new(install_dir)
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("无效的 install_dir: {install_dir}"))?;
+        std::fs::create_dir_all(parent_dir)?;
+        let export_tar = parent_dir
+            .join(format!("{}-ubuntu-2204-export.tar", name))
+            .to_string_lossy()
+            .to_string();
         let export = tokio::process::Command::new("wsl.exe")
             .args(["--export", &source, &export_tar])
             .output()
@@ -173,6 +181,12 @@ impl WslProvider {
             anyhow::bail!("导出 Ubuntu 发行版失败: {stderr}");
         }
 
+        // --import 的目标目录必须为空（或不存在）
+        if Path::new(install_dir).exists() {
+            std::fs::remove_dir_all(install_dir)
+                .with_context(|| format!("清理旧安装目录失败: {install_dir}"))?;
+        }
+
         let import = tokio::process::Command::new("wsl.exe")
             .args(["--import", name, install_dir, &export_tar, "--version", "2"])
             .output()
@@ -181,7 +195,9 @@ impl WslProvider {
 
         if !import.status.success() {
             let stderr = String::from_utf8_lossy(&import.stderr);
-            anyhow::bail!("导入 fallback Ubuntu 到实例失败: {stderr}");
+            let stdout = String::from_utf8_lossy(&import.stdout);
+            let _ = Self::run_wsl(&["--unregister", name]).await;
+            anyhow::bail!("导入 fallback Ubuntu 到实例失败:\nstdout: {stdout}\nstderr: {stderr}");
         }
 
         let _ = std::fs::remove_file(&export_tar);
@@ -259,11 +275,18 @@ impl VmProvider for WslProvider {
         let appdata = std::env::var("LOCALAPPDATA")
             .unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Local".into());
         let install_dir = format!("{}\\AgentBox\\{}", appdata, config.name);
-        let rootfs_path = format!("{}\\ubuntu-rootfs.tar.gz", install_dir);
+        let workspace_dir = format!("{}\\AgentBox", appdata);
+        std::fs::create_dir_all(&workspace_dir)?;
+        let rootfs_path = format!("{}\\{}-ubuntu-rootfs.tar.gz", workspace_dir, config.name);
 
-        std::fs::create_dir_all(&install_dir)?;
         let downloaded = Self::download_ubuntu_rootfs(&rootfs_path).await;
         if downloaded.is_ok() {
+            // --import 的目标目录必须为空（或不存在）
+            if Path::new(&install_dir).exists() {
+                std::fs::remove_dir_all(&install_dir)
+                    .with_context(|| format!("清理旧安装目录失败: {}", install_dir))?;
+            }
+
             let import = tokio::process::Command::new("wsl.exe")
                 .args(["--import", &config.name, &install_dir, &rootfs_path, "--version", "2"])
                 .output()
@@ -272,7 +295,9 @@ impl VmProvider for WslProvider {
 
             if !import.status.success() {
                 let stderr = String::from_utf8_lossy(&import.stderr);
-                anyhow::bail!("WSL import failed: {stderr}");
+                let stdout = String::from_utf8_lossy(&import.stdout);
+                let _ = Self::run_wsl(&["--unregister", &config.name]).await;
+                anyhow::bail!("WSL import failed:\nstdout: {stdout}\nstderr: {stderr}");
             }
 
             let _ = std::fs::remove_file(&rootfs_path);
