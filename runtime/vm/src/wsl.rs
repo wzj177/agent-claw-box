@@ -80,7 +80,7 @@ impl WslProvider {
 
         match output {
             Ok(o) if o.status.success() => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
+                let stdout = Self::decode_windows_output(&o.stdout);
                 stdout.lines().any(|line| line.trim() == name)
             }
             _ => false,
@@ -99,7 +99,7 @@ impl WslProvider {
             return None;
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stdout = Self::decode_windows_output(&output.stdout);
         let distros: Vec<String> = stdout
             .lines()
             .map(|l| l.trim().trim_start_matches('*').trim().to_string())
@@ -119,22 +119,33 @@ impl WslProvider {
     ///
     /// Ubuntu 官方 WSL rootfs 的 URL 格式历史上曾多次变动，
     /// 使用候选列表可以对抗 CDN 路径调整导致的 404。
-    async fn download_ubuntu_rootfs(dest_path: &str) -> Result<()> {
-        // 候选 URL：按优先级排列，依次尝试
-        let candidates = [
-            // 中科大镜像（推荐）
-            "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
-            "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
-            // Ubuntu 24.04 LTS (noble) — 当前推荐
-            "https://cloud-images.ubuntu.com/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
-            // 备用路径格式（部分镜像站使用）
-            "https://cloud-images.ubuntu.com/wsl/releases/noble/release/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
-            // Ubuntu 22.04 LTS (jammy) 降级兜底
-            "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
-        ];
+    async fn download_ubuntu_rootfs(dest_path: &str, ubuntu_image: Option<&str>) -> Result<()> {
+        // 根据用户镜像选择调整优先级：noble（24.04）/ jammy（22.04）。
+        let prefer_jammy = matches!(
+            ubuntu_image.map(|s| s.to_lowercase()),
+            Some(v) if v.contains("jammy") || v.contains("22.04") || v.contains("desktop")
+        );
+
+        let candidates: Vec<&str> = if prefer_jammy {
+            vec![
+                "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://cloud-images.ubuntu.com/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://cloud-images.ubuntu.com/wsl/releases/noble/release/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+            ]
+        } else {
+            vec![
+                "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://cloud-images.ubuntu.com/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://cloud-images.ubuntu.com/wsl/releases/noble/release/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
+            ]
+        };
 
         let mut last_err = String::new();
-        for url in &candidates {
+        for url in candidates {
             info!("下载 Ubuntu WSL rootfs: {}", url);
             let script = format!(
                 "Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing",
@@ -299,7 +310,7 @@ impl VmProvider for WslProvider {
         std::fs::create_dir_all(&workspace_dir)?;
         let rootfs_path = format!("{}\\{}-ubuntu-rootfs.tar.gz", workspace_dir, config.name);
 
-        let downloaded = Self::download_ubuntu_rootfs(&rootfs_path).await;
+        let downloaded = Self::download_ubuntu_rootfs(&rootfs_path, config.ubuntu_image.as_deref()).await;
         if downloaded.is_ok() {
             // --import 的目标目录必须为空（或不存在）
             if Path::new(&install_dir).exists() {

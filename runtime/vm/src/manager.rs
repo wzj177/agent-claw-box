@@ -38,6 +38,17 @@ pub enum SetupStage {
 
 impl VmManager {
     #[cfg(target_os = "windows")]
+    fn runtime_mode_from_name(name: &str) -> Option<String> {
+        if name.starts_with("wsl-") {
+            Some("wsl".to_string())
+        } else if name.starts_with("qemu-") {
+            Some("qemu".to_string())
+        } else {
+            None
+        }
+    }
+
+    #[cfg(target_os = "windows")]
     fn decode_windows_output(bytes: &[u8]) -> String {
         // Some Windows CLIs return UTF-16LE. Detect by frequent NUL bytes in odd positions.
         let odd_nul_count = bytes
@@ -61,7 +72,7 @@ impl VmManager {
 
     /// Create a new VmManager with the platform-appropriate provider.
     pub fn new(config: VmConfig) -> Self {
-        let (provider, runtime_notice) = Self::detect_provider();
+        let (provider, runtime_notice) = Self::detect_provider(&config);
         Self {
             provider,
             config,
@@ -86,13 +97,27 @@ impl VmManager {
     }
 
     /// Detect the correct VM provider for the current platform.
-    fn detect_provider() -> (Arc<dyn VmProvider>, Option<String>) {
+    fn detect_provider(config: &VmConfig) -> (Arc<dyn VmProvider>, Option<String>) {
         #[cfg(target_os = "macos")]
         {
             (Arc::new(crate::lima::LimaProvider::new()), None)
         }
         #[cfg(target_os = "windows")]
         {
+            let preferred_mode = config
+                .runtime_mode
+                .clone()
+                .or_else(|| Self::runtime_mode_from_name(&config.name))
+                .map(|m| m.to_lowercase());
+
+            if preferred_mode.as_deref() == Some("qemu") {
+                tracing::info!("Windows 运行时：用户选择 QEMU 提供者");
+                return (
+                    Arc::new(crate::qemu::QemuProvider::new()),
+                    Some("当前运行模式：QEMU（手动选择）".to_string()),
+                );
+            }
+
             // 优先使用 WSL2；若系统未启用 WSL 或缺少 Hyper-V/虚拟化能力，降级到 QEMU。
             let wsl_installed = std::process::Command::new("wsl.exe")
                 .arg("--version")
@@ -119,6 +144,25 @@ impl VmManager {
                     o.status.success() && !hyperv_missing
                 })
                 .unwrap_or(false);
+
+            if preferred_mode.as_deref() == Some("wsl") {
+                if wsl_installed && wsl_can_create_vm {
+                    tracing::info!("Windows 运行时：用户选择 WSL2 提供者");
+                    return (
+                        Arc::new(crate::wsl::WslProvider::new()),
+                        Some("当前运行模式：WSL2（手动选择）".to_string()),
+                    );
+                }
+
+                tracing::warn!("用户选择 WSL2，但当前系统不可用，自动降级到 QEMU");
+                return (
+                    Arc::new(crate::qemu::QemuProvider::new()),
+                    Some(
+                        "你选择了 WSL2，但当前系统不可用，已自动切换到 QEMU 模式"
+                            .to_string(),
+                    ),
+                );
+            }
 
             if wsl_installed && wsl_can_create_vm {
                 tracing::info!("Windows 运行时：使用 WSL2 提供者");

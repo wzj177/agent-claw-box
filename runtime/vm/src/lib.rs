@@ -26,6 +26,13 @@ pub struct VmConfig {
     pub memory_mb: u64,
     /// Disk size in gigabytes.
     pub disk_gb: u64,
+    /// Preferred runtime on Windows: auto | wsl | qemu.
+    /// On non-Windows platforms this is ignored.
+    #[serde(default)]
+    pub runtime_mode: Option<String>,
+    /// Preferred Ubuntu image for WSL provisioning, e.g. noble | jammy | ubuntu-22.04-desktop.
+    #[serde(default)]
+    pub ubuntu_image: Option<String>,
 }
 
 impl Default for VmConfig {
@@ -35,6 +42,8 @@ impl Default for VmConfig {
             cpus: 2,
             memory_mb: 4096,
             disk_gb: 20,
+            runtime_mode: None,
+            ubuntu_image: None,
         }
     }
 }

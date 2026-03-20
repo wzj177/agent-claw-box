@@ -206,8 +206,23 @@ async fn verify_vm_internet_connectivity(
     );
 }
 
-fn vm_name_for_instance(template: &str, instance_no: i64) -> String {
-    format!("agentbox-{}-{}", template, instance_no)
+fn runtime_prefix_from_vm_name(vm_name: &str) -> Option<&'static str> {
+    if vm_name.starts_with("wsl-") {
+        Some("wsl")
+    } else if vm_name.starts_with("qemu-") {
+        Some("qemu")
+    } else {
+        None
+    }
+}
+
+fn vm_name_for_instance(template: &str, instance_no: i64, runtime_mode: Option<&str>) -> String {
+    let base = format!("agentbox-{}-{}", template, instance_no);
+    match runtime_mode.map(|s| s.trim().to_lowercase()) {
+        Some(mode) if mode == "wsl" => format!("wsl-{}", base),
+        Some(mode) if mode == "qemu" => format!("qemu-{}", base),
+        _ => base,
+    }
 }
 
 fn vm_for_agent(state: &AppState, agent: &AgentInfo) -> Arc<agentbox_vm::VmManager> {
@@ -424,6 +439,8 @@ pub struct AgentInfo {
     pub install_method: String,
     pub container_name: String,
     pub vm_name: String,
+    pub runtime_mode: Option<String>,
+    pub ubuntu_image: Option<String>,
 }
 
 /// Metrics snapshot for a single agent.
@@ -447,6 +464,15 @@ pub struct TemplateInfo {
     pub install_method: String,
     pub resources: template::ResourceConfig,
     pub config_schema: Vec<ConfigField>,
+}
+
+/// Optional deployment preferences selected in marketplace.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CreateAgentOptions {
+    /// Runtime mode on Windows: auto | wsl | qemu
+    pub runtime_mode: Option<String>,
+    /// Ubuntu image preference for WSL provisioning: noble | jammy | ubuntu-22.04-desktop
+    pub ubuntu_image: Option<String>,
 }
 
 /// System resource info.
@@ -478,7 +504,13 @@ pub async fn list_agents(state: State<'_, AppState>) -> Result<Vec<AgentInfo>, S
     let _ = normalize_agent_statuses(&state).await;
     let _ = reconcile_agent_statuses(&state).await;
 
-    let mut rows: Vec<AgentInfo> = sqlx::query_as("SELECT * FROM agents ORDER BY created_at DESC")
+    let mut rows: Vec<AgentInfo> = sqlx::query_as(
+        "SELECT a.*, 
+            (SELECT config_value FROM agent_configs c WHERE c.agent_id = a.id AND c.config_key = 'runtime_mode' LIMIT 1) AS runtime_mode,
+            (SELECT config_value FROM agent_configs c WHERE c.agent_id = a.id AND c.config_key = 'ubuntu_image' LIMIT 1) AS ubuntu_image
+         FROM agents a
+         ORDER BY a.created_at DESC"
+    )
     .fetch_all(&state.db)
     .await
     .map_err(|e: sqlx::Error| e.to_string())?;
@@ -641,6 +673,7 @@ async fn find_available_port(db: &sqlx::SqlitePool, base_port: u16) -> Result<u1
 pub async fn create_agent(
     name: String,
     template: String,
+    options: Option<CreateAgentOptions>,
     state: State<'_, AppState>,
 ) -> Result<AgentInfo, String> {
     // Verify VM/Docker is ready before proceeding
@@ -680,7 +713,16 @@ pub async fn create_agent(
     let base_port = tmpl.ports.first().map(|p| p.host).unwrap_or(3000);
     let port = find_available_port(&state.db, base_port).await?;
 
-    let vm_name = vm_name_for_instance(&template, instance_no);
+    let runtime_mode = options
+        .as_ref()
+        .and_then(|o| o.runtime_mode.clone())
+        .filter(|s| !s.trim().is_empty());
+    let ubuntu_image = options
+        .as_ref()
+        .and_then(|o| o.ubuntu_image.clone())
+        .filter(|s| !s.trim().is_empty());
+
+    let vm_name = vm_name_for_instance(&template, instance_no, runtime_mode.as_deref());
     let container_name = vm_name.clone();
 
     let health_url = tmpl.health.url.replace(
@@ -706,6 +748,30 @@ pub async fn create_agent(
     .await
     .map_err(|e| e.to_string())?;
 
+    // Persist deployment preferences for display and future diagnostics.
+    if let Some(mode) = &runtime_mode {
+        sqlx::query(
+            "INSERT INTO agent_configs (agent_id, config_key, config_value, is_secret, updated_at)
+             VALUES (?, 'runtime_mode', ?, 0, datetime('now'))"
+        )
+        .bind(&id)
+        .bind(mode)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+    if let Some(image) = &ubuntu_image {
+        sqlx::query(
+            "INSERT INTO agent_configs (agent_id, config_key, config_value, is_secret, updated_at)
+             VALUES (?, 'ubuntu_image', ?, 0, datetime('now'))"
+        )
+        .bind(&id)
+        .bind(image)
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+    }
+
     // Capture fields before moving tmpl into async block
     let ret_version = tmpl.version.clone();
     let ret_install_method = tmpl.install_method.clone();
@@ -716,13 +782,22 @@ pub async fn create_agent(
     let agent_id = id.clone();
     let c_name = container_name.clone();
     let vm_name_clone = vm_name.clone();
+    let runtime_mode_clone = runtime_mode.clone();
+    let ubuntu_image_clone = ubuntu_image.clone();
     let prov_lock = state.provisioning_lock.clone();
     let prov_count = provisioning_guard.release_to_spawn();
     tauri::async_runtime::spawn(async move {
         // Acquire provisioning lock — only one create/upgrade at a time
         let _guard = prov_lock.lock().await;
-        let docker = app_state.docker_for_vm_name(&vm_name_clone);
-        let vm = app_state.vm_for_name(&vm_name_clone);
+        let vm = Arc::new(agentbox_vm::VmManager::new(agentbox_vm::VmConfig {
+            name: vm_name_clone.clone(),
+            cpus: tmpl.resources.cpus,
+            memory_mb: tmpl.resources.memory_mb,
+            disk_gb: tmpl.resources.disk_gb,
+            runtime_mode: runtime_mode_clone.clone(),
+            ubuntu_image: ubuntu_image_clone.clone(),
+        }));
+        let docker = agentbox_docker::ContainerRuntime::with_prefix(vm.docker_cmd_prefix());
         // 30-minute timeout prevents agents from being stuck in CREATING forever
         // (native agents like OpenClaw may need 20+ min for npm install with retries)
         let result = tokio::time::timeout(
@@ -793,6 +868,8 @@ pub async fn create_agent(
         install_method: ret_install_method,
         container_name,
         vm_name,
+        runtime_mode,
+        ubuntu_image,
     })
 }
 
@@ -2317,7 +2394,8 @@ pub async fn upgrade_agent(
 
     let base_port = tmpl.ports.first().map(|p| p.host).unwrap_or(3000);
     let port = find_available_port(&state.db, base_port).await?;
-    let vm_name = vm_name_for_instance(&old_agent.template, instance_no);
+    let runtime_mode = runtime_prefix_from_vm_name(&old_agent.vm_name);
+    let vm_name = vm_name_for_instance(&old_agent.template, instance_no, runtime_mode);
     let container_name = vm_name.clone();
     let health_url = tmpl.health.url.replace(
         &format!(":{}", tmpl.ports.first().map(|p| p.container).unwrap_or(0)),
@@ -2401,6 +2479,8 @@ pub async fn upgrade_agent(
                     install_method: ret_install_method.clone(),
                     container_name: c_name.clone(),
                     vm_name: vm_name_clone.clone(),
+                    runtime_mode: old_agent_clone.runtime_mode.clone(),
+                    ubuntu_image: old_agent_clone.ubuntu_image.clone(),
                 };
 
                 if let Err(e) = restore_backup_into_agent_internal(&new_agent_for_import, &backup_path_clone, &app_state, false).await {
@@ -2462,6 +2542,8 @@ pub async fn upgrade_agent(
         install_method: ret_install_method_ret,
         container_name,
         vm_name,
+        runtime_mode: old_agent.runtime_mode,
+        ubuntu_image: old_agent.ubuntu_image,
     })
 }
 

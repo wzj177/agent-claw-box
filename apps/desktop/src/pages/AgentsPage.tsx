@@ -114,6 +114,23 @@ function AgentCard({
   const [needsConfig, setNeedsConfig] = useState(false);
   const [showConfigOverlay, setShowConfigOverlay] = useState(false);
 
+  const runtimeModeLabel = (() => {
+    const mode = (agent.runtime_mode ?? "").toLowerCase();
+    if (mode === "wsl") return "WSL2";
+    if (mode === "qemu") return "QEMU";
+    if (agent.vm_name.startsWith("wsl-")) return "WSL2";
+    if (agent.vm_name.startsWith("qemu-")) return "QEMU";
+    return "自动";
+  })();
+
+  const ubuntuImageLabel = (() => {
+    const image = (agent.ubuntu_image ?? "").toLowerCase();
+    if (!image) return "默认";
+    if (image.includes("noble")) return "Ubuntu 24.04";
+    if (image.includes("jammy") || image.includes("22.04")) return "Ubuntu 22.04";
+    return agent.ubuntu_image ?? "默认";
+  })();
+
   // Check if required config fields are filled
   useEffect(() => {
     let cancelled = false;
@@ -270,6 +287,8 @@ function AgentCard({
       {/* Card body */}
       <div className="px-4 py-3 space-y-2">
         <InfoRow label="端口" value={String(agent.port)} />
+        <InfoRow label="运行模式" value={runtimeModeLabel} />
+        <InfoRow label="Ubuntu 镜像" value={ubuntuImageLabel} />
         <InfoRow label="开机自启" value={agent.auto_start ? "已开启" : "未开启"} />
         {agent.install_method === "native" && (
           <InfoRow label="SSH" value={`ssh ${agent.vm_name}`} valueClass="text-xs font-mono select-all" />

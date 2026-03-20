@@ -18,6 +18,8 @@ export interface AgentInfo {
   install_method: string;
   container_name: string;
   vm_name: string;
+  runtime_mode?: string | null;
+  ubuntu_image?: string | null;
 }
 
 export type AgentStatus =
@@ -100,6 +102,11 @@ export interface SshConnectionInfo {
   command_with_config: string;
 }
 
+export interface CreateAgentOptions {
+  runtime_mode?: "auto" | "wsl" | "qemu";
+  ubuntu_image?: "noble" | "jammy" | "ubuntu-22.04-desktop";
+}
+
 // ---------------------------------------------------------------------------
 // API calls (thin wrappers around Tauri invoke)
 // ---------------------------------------------------------------------------
@@ -109,8 +116,8 @@ export const api = {
 
   isProvisioning: () => invoke<boolean>("is_provisioning"),
 
-  createAgent: (name: string, template: string) =>
-    invoke<AgentInfo>("create_agent", { name, template }),
+  createAgent: (name: string, template: string, options?: CreateAgentOptions) =>
+    invoke<AgentInfo>("create_agent", { name, template, options }),
 
   startAgent: (id: string) => invoke<void>("start_agent", { id }),
 

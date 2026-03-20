@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Download, Search, Cpu, HardDrive, MemoryStick } from "lucide-react";
-import { api, type TemplateInfo, type SystemInfo } from "../lib/api";
+import { api, type TemplateInfo, type SystemInfo, type CreateAgentOptions } from "../lib/api";
 import { useNavigate } from "react-router-dom";
 
 const INSTALL_METHOD_LABELS: Record<string, string> = {
@@ -19,6 +19,9 @@ export function MarketplacePage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [deployError, setDeployError] = useState<string | null>(null);
   const [provisioning, setProvisioning] = useState(false);
+  const [deployDialog, setDeployDialog] = useState<TemplateInfo | null>(null);
+  const [runtimeMode, setRuntimeMode] = useState<"auto" | "wsl" | "qemu">("auto");
+  const [ubuntuImage, setUbuntuImage] = useState<"noble" | "jammy" | "ubuntu-22.04-desktop">("noble");
 
   useEffect(() => {
     const load = async () => {
@@ -57,12 +60,12 @@ export function MarketplacePage() {
       t.description.includes(search)
   );
 
-  const handleDeploy = async (template: TemplateInfo) => {
+  const handleDeploy = async (template: TemplateInfo, options?: CreateAgentOptions) => {
     setDeploying(template.id);
     setDeployError(null);
     setProvisioning(true);
     try {
-      await api.createAgent(template.name, template.id);
+      await api.createAgent(template.name, template.id, options);
       navigate("/");
     } catch (e) {
       setDeployError(`${template.name} 部署失败: ${e}`);
@@ -70,6 +73,23 @@ export function MarketplacePage() {
     } finally {
       setDeploying(null);
     }
+  };
+
+  const openDeployDialog = (template: TemplateInfo) => {
+    setRuntimeMode("auto");
+    setUbuntuImage("noble");
+    setDeployDialog(template);
+  };
+
+  const confirmDeploy = async () => {
+    if (!deployDialog) return;
+    const opts: CreateAgentOptions = {
+      runtime_mode: runtimeMode,
+      ubuntu_image: ubuntuImage,
+    };
+    const template = deployDialog;
+    setDeployDialog(null);
+    await handleDeploy(template, opts);
   };
 
   return (
@@ -157,7 +177,7 @@ export function MarketplacePage() {
               <span className="text-caption text-neutral-300">v{t.version}</span>
               <div className="flex-1" />
               <button
-                onClick={() => handleDeploy(t)}
+                onClick={() => openDeployDialog(t)}
                 disabled={deploying === t.id || provisioning}
                 className="btn-primary"
               >
@@ -172,6 +192,65 @@ export function MarketplacePage() {
       {filtered.length === 0 && !loadError && (
         <div className="text-center py-16 text-caption text-neutral-400">
           没有找到匹配的模板
+        </div>
+      )}
+
+      {deployDialog && (
+        <div className="fixed inset-0 z-50 bg-black/30 flex items-center justify-center p-4">
+          <div className="w-full max-w-lg bg-white rounded-xl border border-neutral-200 shadow-lg p-5 space-y-4">
+            <div>
+              <h3 className="text-base font-semibold text-neutral-800">部署 {deployDialog.name}</h3>
+              <p className="text-caption text-neutral-500 mt-1">
+                请选择运行模式和 Ubuntu 镜像（仅 Windows 生效，其他系统自动忽略）。
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label className="block text-caption text-neutral-600">运行模式</label>
+              <select
+                value={runtimeMode}
+                onChange={(e) => setRuntimeMode(e.target.value as "auto" | "wsl" | "qemu")}
+                className="w-full px-3 py-2 text-body bg-white border border-neutral-300 rounded-md focus:outline-none focus:border-primary-400 focus:ring-1 focus:ring-primary-100"
+              >
+                <option value="auto">自动（推荐）</option>
+                <option value="wsl">WSL2 模式</option>
+                <option value="qemu">QEMU 模式（无需 WSL）</option>
+              </select>
+            </div>
+
+            <div className="space-y-2">
+              <label className="block text-caption text-neutral-600">Ubuntu 镜像</label>
+              <select
+                value={ubuntuImage}
+                onChange={(e) => setUbuntuImage(e.target.value as "noble" | "jammy" | "ubuntu-22.04-desktop")}
+                className="w-full px-3 py-2 text-body bg-white border border-neutral-300 rounded-md focus:outline-none focus:border-primary-400 focus:ring-1 focus:ring-primary-100"
+              >
+                <option value="noble">Ubuntu 24.04（Noble，默认）</option>
+                <option value="jammy">Ubuntu 22.04（Jammy，稳定）</option>
+                <option value="ubuntu-22.04-desktop">Ubuntu Desktop 22.04（WSL 商店）</option>
+              </select>
+              <p className="text-caption text-neutral-400">
+                说明：选择 Desktop 时，若 rootfs 下载失败，会回退使用 `wsl --install -d Ubuntu-22.04`。
+              </p>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                onClick={() => setDeployDialog(null)}
+                className="btn-default"
+                disabled={deploying !== null}
+              >
+                取消
+              </button>
+              <button
+                onClick={confirmDeploy}
+                className="btn-primary"
+                disabled={deploying !== null || provisioning}
+              >
+                确认部署
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
