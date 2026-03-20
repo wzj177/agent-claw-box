@@ -31,13 +31,31 @@ brew install lima
 
 1. 下载 `.exe` 安装包并运行
 2. 按向导安装
-3. 确保已启用 WSL 2：
+
+> **天配图占位 - 安装向导界面截图**
+
+AgentClawBox 在 Windows 上支持两种运行方式，**自动检测、无需手动选择**：
+
+| 方式 | 适用场景 | 性能 |
+|------|---------|------|
+| WSL 2 | 已开启 WSL 的用户 | 较好 |
+| QEMU | 未开启 WSL、Windows Home、公司机 | 较好 |
+
+**如需启用 WSL 2**（推荐）：
 
 ```powershell
 wsl --install
 ```
 
 重启后 WSL 2 即可使用。
+
+**如需使用 QEMU 模式**（无需 WSL）：
+
+```powershell
+winget install qemu
+```
+
+安装完成后重启 AgentClawBox，应用会自动切换到 QEMU 模式。
 
 ### Linux（Ubuntu/Debian）
 
@@ -62,10 +80,13 @@ sudo usermod -aG docker $USER
 
 启动 AgentClawBox 后，应用会自动检测和初始化运行环境：
 
+> **天配图占位 - 初始化加载层界面截图（启动加载进度）**
+
 | 平台 | 初始化内容 |
 |------|-----------|
 | macOS | 创建 Lima VM（`agentbox`）、安装 Docker |
-| Windows | 检查 WSL 2、安装 Docker |
+| Windows（有 WSL） | 检查 WSL 2、安装 Docker |
+| Windows（无 WSL） | 启动 QEMU VM、安装 Docker |
 | Linux | 检查本地 Docker |
 
 初始化过程在后台进行。在状态栏显示"环境就绪"之前，无法创建 Agent。
@@ -77,12 +98,20 @@ sudo usermod -aG docker $USER
 ## 部署 Agent
 
 1. 点击左侧导航栏 **应用市场**
-2. 浏览可用模板，点击 **部署** 按钮
+
+> **天配图占位 - 应用市场页面截图**
+
+2. 浏览可用模板，点击 **部署** 按鈕
+
+> **天配图占位 - 部署确认弹窗截图**
+
 3. AgentClawBox 会自动：
    - 在 VM 中安装 Agent 依赖
    - 配置运行环境
    - 启动 Agent 服务
 4. 部署完成后跳转到 **我的 Agent** 页面，状态显示为 `运行中`
+
+> **天配图占位 - 实例列表页（运行中状态）截图**
 
 > **注意**：同一时刻只能部署一个实例，需等前一个完成后才能部署下一个。
 
@@ -101,6 +130,8 @@ sudo usermod -aG docker $USER
 部署完成后需要配置 LLM 服务商和 API Key：
 
 1. 在 Agent 卡片上点击 **配置**（齿轮图标）
+
+> **天配图占位 - Agent 配置页面截图**
 2. 填写以下字段：
 
 | 字段 | 说明 | 示例 |

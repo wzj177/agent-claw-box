@@ -7,6 +7,8 @@ mod manager;
 mod lima;
 #[cfg(target_os = "windows")]
 mod wsl;
+#[cfg(target_os = "windows")]
+mod qemu;
 #[cfg(target_os = "linux")]
 mod native;
 

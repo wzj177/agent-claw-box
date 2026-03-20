@@ -65,6 +65,49 @@ impl WslProvider {
             _ => false,
         }
     }
+
+    /// 下载 Ubuntu WSL rootfs，依次尝试多个候选 URL，任一成功即返回。
+    ///
+    /// Ubuntu 官方 WSL rootfs 的 URL 格式历史上曾多次变动，
+    /// 使用候选列表可以对抗 CDN 路径调整导致的 404。
+    async fn download_ubuntu_rootfs(dest_path: &str) -> Result<()> {
+        // 候选 URL：按优先级排列，依次尝试
+        let candidates = [
+            // Ubuntu 24.04 LTS (noble) — 当前推荐
+            "https://cloud-images.ubuntu.com/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+            // 备用路径格式（部分镜像站使用）
+            "https://cloud-images.ubuntu.com/wsl/releases/noble/release/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+            // Ubuntu 22.04 LTS (jammy) 降级兜底
+            "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
+        ];
+
+        let mut last_err = String::new();
+        for url in &candidates {
+            info!("下载 Ubuntu WSL rootfs: {}", url);
+            let script = format!(
+                "Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing",
+                url, dest_path
+            );
+            let output = tokio::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output()
+                .await
+                .context("powershell 执行失败")?;
+
+            if output.status.success() {
+                info!("rootfs 下载成功: {}", url);
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            warn!("下载失败 ({}): {}", url, stderr.trim());
+            last_err = format!("URL: {url}\n{}", stderr.trim());
+        }
+
+        anyhow::bail!(
+            "所有候选 URL 均下载失败，请检查网络连接。\n最后一次错误：\n{last_err}"
+        )
+    }
 }
 
 #[async_trait::async_trait]
@@ -131,60 +174,29 @@ impl VmProvider for WslProvider {
             return self.start(&config.name).await;
         }
 
-        // Install a new Ubuntu-based distro
-        // Use `wsl --install -d Ubuntu` and then rename, or import a rootfs
-        let output = tokio::process::Command::new("wsl.exe")
-            .args(["--install", "-d", "Ubuntu", "--name", &config.name])
+        // Always import a fresh Ubuntu rootfs as the target distro name.
+        info!("Downloading Ubuntu rootfs for import...");
+        let appdata = std::env::var("LOCALAPPDATA")
+            .unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Local".into());
+        let install_dir = format!("{}\\AgentBox\\{}", appdata, config.name);
+        let rootfs_path = format!("{}\\ubuntu-rootfs.tar.gz", install_dir);
+
+        std::fs::create_dir_all(&install_dir)?;
+        Self::download_ubuntu_rootfs(&rootfs_path).await?;
+
+        let import = tokio::process::Command::new("wsl.exe")
+            .args(["--import", &config.name, &install_dir, &rootfs_path, "--version", "2"])
             .output()
-            .await;
+            .await
+            .context("Failed to import WSL distro")?;
 
-        match output {
-            Ok(o) if o.status.success() => {
-                info!(name = %config.name, "WSL distro created");
-            }
-            _ => {
-                // Fallback: try import with Ubuntu rootfs download
-                info!("Trying import-based distro creation...");
-                let appdata = std::env::var("LOCALAPPDATA")
-                    .unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Local".into());
-                let install_dir = format!("{}\\AgentBox\\{}", appdata, config.name);
-                let rootfs_url = "https://cloud-images.ubuntu.com/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz";
-                let rootfs_path = format!("{}\\ubuntu-rootfs.tar.gz", install_dir);
-
-                // Download rootfs
-                std::fs::create_dir_all(&install_dir)?;
-                let dl = tokio::process::Command::new("powershell.exe")
-                    .args([
-                        "-Command",
-                        &format!(
-                            "Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing",
-                            rootfs_url, rootfs_path
-                        ),
-                    ])
-                    .output()
-                    .await
-                    .context("Failed to download Ubuntu rootfs")?;
-
-                if !dl.status.success() {
-                    let stderr = String::from_utf8_lossy(&dl.stderr);
-                    anyhow::bail!("Failed to download rootfs: {stderr}");
-                }
-
-                // Import
-                let import = tokio::process::Command::new("wsl.exe")
-                    .args(["--import", &config.name, &install_dir, &rootfs_path, "--version", "2"])
-                    .output()
-                    .await
-                    .context("Failed to import WSL distro")?;
-
-                if !import.status.success() {
-                    let stderr = String::from_utf8_lossy(&import.stderr);
-                    anyhow::bail!("WSL import failed: {stderr}");
-                }
-
-                let _ = std::fs::remove_file(&rootfs_path);
-            }
+        if !import.status.success() {
+            let stderr = String::from_utf8_lossy(&import.stderr);
+            anyhow::bail!("WSL import failed: {stderr}");
         }
+
+        let _ = std::fs::remove_file(&rootfs_path);
+        info!(name = %config.name, "WSL distro imported successfully");
 
         // Set resource limits via .wslconfig
         let wslconfig_path = dirs_next::home_dir()

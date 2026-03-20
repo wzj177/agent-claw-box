@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { Box, Store, UserCircle2 } from "lucide-react";
+import { Box, Store, UserCircle2, LifeBuoy } from "lucide-react";
 
 export function Layout() {
   return (
@@ -16,6 +16,7 @@ export function Layout() {
         <nav className="flex-1 py-2 px-3 space-y-0.5">
           <SidebarLink to="/" icon={<Box className="w-4 h-4" />} label="我的实例" />
           <SidebarLink to="/marketplace" icon={<Store className="w-4 h-4" />} label="应用市场" />
+          <SidebarLink to="/help" icon={<LifeBuoy className="w-4 h-4" />} label="帮助中心" />
           <SidebarLink to="/about" icon={<UserCircle2 className="w-4 h-4" />} label="关于我" />
         </nav>
 

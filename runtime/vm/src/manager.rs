@@ -68,7 +68,20 @@ impl VmManager {
         }
         #[cfg(target_os = "windows")]
         {
-            Arc::new(crate::wsl::WslProvider::new())
+            // 优先使用 WSL2；若系统未启用 WSL，降级到 QEMU（适用于 Windows Home
+            // 以及禁用 Hyper-V 的企业环境）。
+            let wsl_available = std::process::Command::new("wsl.exe")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if wsl_available {
+                tracing::info!("Windows 运行时：使用 WSL2 提供者");
+                Arc::new(crate::wsl::WslProvider::new())
+            } else {
+                tracing::info!("Windows 运行时：WSL2 不可用，降级到 QEMU 提供者");
+                Arc::new(crate::qemu::QemuProvider::new())
+            }
         }
         #[cfg(target_os = "linux")]
         {

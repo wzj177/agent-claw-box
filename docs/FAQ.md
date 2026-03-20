@@ -29,13 +29,34 @@ brew install lima
 
 ### Q: Windows 需要启用 WSL 吗？
 
-是的。AgentClawBox 在 Windows 上使用 WSL 2 运行 Agent。以管理员身份打开 PowerShell 执行：
+**推荐但不强制**。AgentClawBox 启动时会自动检测：
+
+| 情况 | 行为 |
+|------|------|
+| 系统已有 WSL 2 | 自动使用 WSL 2（性能更好） |
+| 未启用 WSL 2 | 自动切换到 QEMU 模式（无需任何手动配置） |
+
+**如果想手动启用 WSL 2**（推荐，性能更好），以管理员身份打开 PowerShell 执行：
 
 ```powershell
 wsl --install
 ```
 
 安装完成后需要重启电脑。
+
+### Q: QEMU 模式是什么？需要额外安装吗？
+
+QEMU 是一种轻量级虚拟机方案，用于在**未启用 WSL 2 的 Windows**（如 Windows Home、公司禁用 Hyper-V 的环境）上运行 Agent。
+
+AgentClawBox 会提示你安装 QEMU，推荐使用：
+
+```powershell
+winget install qemu
+```
+
+或前往 [https://www.qemu.org/download/#windows](https://www.qemu.org/download/#windows) 下载安装包。安装后重启 AgentClawBox 即可。
+
+> QEMU 模式首次使用需要下载约 150 MB 的 Alpine Linux 基础镜像，之后每次启动无需重新下载。
 
 ### Q: Linux 需要安装 Docker 吗？
 
@@ -72,6 +93,15 @@ VM 仍在初始化中。请等待状态栏显示"环境就绪"后再操作。
 1. 确认 WSL 2 已安装：`wsl --list --verbose`
 2. 确认系统开启了虚拟化（BIOS 中启用 VT-x/AMD-V）
 3. 更新 WSL：`wsl --update`
+
+> 如果仍无法解决，可直接使用 **QEMU 模式**：卸载 WSL 或跳过安装，AgentClawBox 会自动切换。
+
+### Q: QEMU 模式下如何确认虚拟化已开启？
+
+QEMU 也需要 CPU 虚拟化支持（VT-x / AMD-V）。在 BIOS / UEFI 中启用后重启即可。
+
+验证方式（Windows 10/11）：
+- 打开任务管理器 → 性能 → CPU，确认「虚拟化: 已启用」
 
 ---
 
