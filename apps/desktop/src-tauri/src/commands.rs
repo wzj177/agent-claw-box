@@ -439,7 +439,9 @@ pub struct AgentInfo {
     pub install_method: String,
     pub container_name: String,
     pub vm_name: String,
+    #[sqlx(default)]
     pub runtime_mode: Option<String>,
+    #[sqlx(default)]
     pub ubuntu_image: Option<String>,
 }
 
