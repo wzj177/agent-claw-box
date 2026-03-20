@@ -66,6 +66,34 @@ impl WslProvider {
         }
     }
 
+    /// 获取当前可用的 Ubuntu 发行版名称（优先 22.04）。
+    async fn detect_ubuntu_distro_name() -> Option<String> {
+        let output = tokio::process::Command::new("wsl.exe")
+            .args(["--list", "--quiet"])
+            .output()
+            .await
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let distros: Vec<String> = stdout
+            .lines()
+            .map(|l| l.trim().trim_start_matches('*').trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+
+        for preferred in ["Ubuntu-22.04", "Ubuntu", "Ubuntu-24.04"] {
+            if distros.iter().any(|d| d == preferred) {
+                return Some(preferred.to_string());
+            }
+        }
+
+        distros.into_iter().find(|d| d.starts_with("Ubuntu"))
+    }
+
     /// 下载 Ubuntu WSL rootfs，依次尝试多个候选 URL，任一成功即返回。
     ///
     /// Ubuntu 官方 WSL rootfs 的 URL 格式历史上曾多次变动，
@@ -73,6 +101,9 @@ impl WslProvider {
     async fn download_ubuntu_rootfs(dest_path: &str) -> Result<()> {
         // 候选 URL：按优先级排列，依次尝试
         let candidates = [
+            // 中科大镜像（推荐）
+            "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+            "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
             // Ubuntu 24.04 LTS (noble) — 当前推荐
             "https://cloud-images.ubuntu.com/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
             // 备用路径格式（部分镜像站使用）
@@ -107,6 +138,55 @@ impl WslProvider {
         anyhow::bail!(
             "所有候选 URL 均下载失败，请检查网络连接。\n最后一次错误：\n{last_err}"
         )
+    }
+
+    /// 当 rootfs URL 全部失败时，回退：安装 Ubuntu-22.04 后导出再导入为实例名。
+    async fn import_from_ubuntu_2204_fallback(name: &str, install_dir: &str) -> Result<()> {
+        info!("rootfs 下载失败，尝试回退流程：wsl --install -d Ubuntu-22.04");
+
+        let install = tokio::process::Command::new("wsl.exe")
+            .args(["--install", "-d", "Ubuntu-22.04"])
+            .output()
+            .await
+            .context("执行 wsl --install -d Ubuntu-22.04 失败")?;
+
+        if !install.status.success() {
+            let stderr = String::from_utf8_lossy(&install.stderr);
+            anyhow::bail!(
+                "rootfs 下载失败，且 Ubuntu-22.04 自动安装失败: {stderr}\n请手动执行: wsl --install -d Ubuntu-22.04"
+            );
+        }
+
+        let source = Self::detect_ubuntu_distro_name()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("未检测到可导出的 Ubuntu 发行版，请先手动执行 wsl --install -d Ubuntu-22.04"))?;
+
+        let export_tar = format!("{}\\ubuntu-2204-export.tar", install_dir);
+        let export = tokio::process::Command::new("wsl.exe")
+            .args(["--export", &source, &export_tar])
+            .output()
+            .await
+            .context("导出 Ubuntu 发行版失败")?;
+
+        if !export.status.success() {
+            let stderr = String::from_utf8_lossy(&export.stderr);
+            anyhow::bail!("导出 Ubuntu 发行版失败: {stderr}");
+        }
+
+        let import = tokio::process::Command::new("wsl.exe")
+            .args(["--import", name, install_dir, &export_tar, "--version", "2"])
+            .output()
+            .await
+            .context("导入 fallback Ubuntu 到实例失败")?;
+
+        if !import.status.success() {
+            let stderr = String::from_utf8_lossy(&import.stderr);
+            anyhow::bail!("导入 fallback Ubuntu 到实例失败: {stderr}");
+        }
+
+        let _ = std::fs::remove_file(&export_tar);
+        info!(name = %name, source = %source, "Fallback import succeeded");
+        Ok(())
     }
 }
 
@@ -182,21 +262,31 @@ impl VmProvider for WslProvider {
         let rootfs_path = format!("{}\\ubuntu-rootfs.tar.gz", install_dir);
 
         std::fs::create_dir_all(&install_dir)?;
-        Self::download_ubuntu_rootfs(&rootfs_path).await?;
+        let downloaded = Self::download_ubuntu_rootfs(&rootfs_path).await;
+        if downloaded.is_ok() {
+            let import = tokio::process::Command::new("wsl.exe")
+                .args(["--import", &config.name, &install_dir, &rootfs_path, "--version", "2"])
+                .output()
+                .await
+                .context("Failed to import WSL distro")?;
 
-        let import = tokio::process::Command::new("wsl.exe")
-            .args(["--import", &config.name, &install_dir, &rootfs_path, "--version", "2"])
-            .output()
-            .await
-            .context("Failed to import WSL distro")?;
+            if !import.status.success() {
+                let stderr = String::from_utf8_lossy(&import.stderr);
+                anyhow::bail!("WSL import failed: {stderr}");
+            }
 
-        if !import.status.success() {
-            let stderr = String::from_utf8_lossy(&import.stderr);
-            anyhow::bail!("WSL import failed: {stderr}");
+            let _ = std::fs::remove_file(&rootfs_path);
+            info!(name = %config.name, "WSL distro imported successfully");
+        } else {
+            warn!(
+                "rootfs download failed, trying fallback Ubuntu-22.04 install/import: {}",
+                downloaded
+                    .err()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+            Self::import_from_ubuntu_2204_fallback(&config.name, &install_dir).await?;
         }
-
-        let _ = std::fs::remove_file(&rootfs_path);
-        info!(name = %config.name, "WSL distro imported successfully");
 
         // Set resource limits via .wslconfig
         let wslconfig_path = dirs_next::home_dir()
