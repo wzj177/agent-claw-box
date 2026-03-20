@@ -46,6 +46,20 @@ pub struct QemuProvider {
 }
 
 impl QemuProvider {
+    fn well_known_qemu_dirs() -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = vec![PathBuf::from(r"C:\Program Files\qemu")];
+        for key in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+            if let Ok(v) = std::env::var(key) {
+                dirs.push(PathBuf::from(v).join("qemu"));
+            }
+        }
+        if let Ok(v) = std::env::var("LOCALAPPDATA") {
+            dirs.push(PathBuf::from(&v).join("Microsoft").join("WinGet").join("Packages"));
+            dirs.push(PathBuf::from(v).join("Programs").join("qemu"));
+        }
+        dirs
+    }
+
     pub fn new() -> Self {
         let (qemu_bin, qemu_img_bin) = Self::locate_qemu_bins();
         let vms_dir = dirs_next::home_dir()
@@ -59,23 +73,92 @@ impl QemuProvider {
         }
     }
 
-    /// 定位 QEMU 二进制文件。优先使用应用旁加载目录，其次降级到系统 PATH。
+    fn qemu_pair_from_dir(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+        let sys = dir.join("qemu-system-x86_64.exe");
+        let img = dir.join("qemu-img.exe");
+        if sys.exists() && img.exists() {
+            Some((sys, img))
+        } else {
+            None
+        }
+    }
+
+    fn find_with_where() -> Option<(PathBuf, PathBuf)> {
+        let output = std::process::Command::new("where.exe")
+            .arg("qemu-system-x86_64.exe")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let first = stdout
+            .lines()
+            .map(|s| s.trim())
+            .find(|s| !s.is_empty())?;
+        let sys = PathBuf::from(first);
+        let dir = sys.parent()?;
+        let img = dir.join("qemu-img.exe");
+        if img.exists() {
+            Some((sys, img))
+        } else {
+            None
+        }
+    }
+
+    /// 定位 QEMU 二进制文件。优先应用旁加载，其次 PATH(where)，再尝试常见安装目录。
     fn locate_qemu_bins() -> (PathBuf, PathBuf) {
         if let Ok(exe) = std::env::current_exe() {
             let dir = exe
                 .parent()
                 .unwrap_or(Path::new("."))
                 .join("qemu");
-            let sys = dir.join("qemu-system-x86_64.exe");
-            let img = dir.join("qemu-img.exe");
-            if sys.exists() {
-                return (sys, img);
+            if let Some(pair) = Self::qemu_pair_from_dir(&dir) {
+                return pair;
             }
         }
-        // 降级：依赖系统 PATH
+
+        if let Some(pair) = Self::find_with_where() {
+            return pair;
+        }
+
+        let dirs = Self::well_known_qemu_dirs();
+
+        for dir in dirs {
+            if dir.ends_with("Packages") {
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for e in entries.flatten() {
+                        let p = e.path();
+                        let is_qemu_pkg = p
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| n.to_lowercase().contains("qemu"))
+                            .unwrap_or(false);
+                        if is_qemu_pkg {
+                            // winget 包目录下通常还有版本子目录
+                            if let Ok(subs) = std::fs::read_dir(&p) {
+                                for s in subs.flatten() {
+                                    let candidate = s.path();
+                                    if let Some(pair) = Self::qemu_pair_from_dir(&candidate) {
+                                        return pair;
+                                    }
+                                }
+                            }
+                            if let Some(pair) = Self::qemu_pair_from_dir(&p) {
+                                return pair;
+                            }
+                        }
+                    }
+                }
+            } else if let Some(pair) = Self::qemu_pair_from_dir(&dir) {
+                return pair;
+            }
+        }
+
+        // 最后降级：依赖 PATH（命令名）
         (
-            PathBuf::from("qemu-system-x86_64"),
-            PathBuf::from("qemu-img"),
+            PathBuf::from("qemu-system-x86_64.exe"),
+            PathBuf::from("qemu-img.exe"),
         )
     }
 
@@ -213,16 +296,32 @@ impl QemuProvider {
 #[async_trait::async_trait]
 impl VmProvider for QemuProvider {
     async fn is_runtime_installed(&self) -> bool {
-        if self.qemu_bin.exists() {
+        // 显式兜底：即使 locate_qemu_bins 早期未命中，也直接检查常见目录。
+        for dir in Self::well_known_qemu_dirs() {
+            if let Some((sys, img)) = Self::qemu_pair_from_dir(&dir) {
+                if sys.exists() && img.exists() {
+                    return true;
+                }
+            }
+        }
+
+        if self.qemu_bin.exists() && self.qemu_img_bin.exists() {
             return true;
         }
-        // 检查系统 PATH 中是否有 QEMU
-        tokio::process::Command::new("qemu-system-x86_64")
+
+        let sys_ok = tokio::process::Command::new("qemu-system-x86_64.exe")
             .arg("--version")
             .output()
             .await
             .map(|o| o.status.success())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        let img_ok = tokio::process::Command::new("qemu-img.exe")
+            .arg("--version")
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        sys_ok && img_ok
     }
 
     async fn install_runtime(&self) -> Result<()> {
