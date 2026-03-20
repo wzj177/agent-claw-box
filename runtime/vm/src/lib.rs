@@ -33,6 +33,9 @@ pub struct VmConfig {
     /// Preferred Ubuntu image for WSL provisioning, e.g. noble | jammy | ubuntu-22.04-desktop.
     #[serde(default)]
     pub ubuntu_image: Option<String>,
+    /// Optional local ISO file path for QEMU mode.
+    #[serde(default)]
+    pub qemu_iso_path: Option<String>,
 }
 
 impl Default for VmConfig {
@@ -44,6 +47,7 @@ impl Default for VmConfig {
             disk_gb: 20,
             runtime_mode: None,
             ubuntu_image: None,
+            qemu_iso_path: None,
         }
     }
 }

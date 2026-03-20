@@ -475,6 +475,8 @@ pub struct CreateAgentOptions {
     pub runtime_mode: Option<String>,
     /// Ubuntu image preference for WSL provisioning: noble | jammy | ubuntu-22.04-desktop
     pub ubuntu_image: Option<String>,
+    /// Optional local ISO file path for QEMU provisioning.
+    pub qemu_iso_path: Option<String>,
 }
 
 /// System resource info.
@@ -723,6 +725,10 @@ pub async fn create_agent(
         .as_ref()
         .and_then(|o| o.ubuntu_image.clone())
         .filter(|s| !s.trim().is_empty());
+    let qemu_iso_path = options
+        .as_ref()
+        .and_then(|o| o.qemu_iso_path.clone())
+        .filter(|s| !s.trim().is_empty());
 
     let vm_name = vm_name_for_instance(&template, instance_no, runtime_mode.as_deref());
     let container_name = vm_name.clone();
@@ -786,6 +792,7 @@ pub async fn create_agent(
     let vm_name_clone = vm_name.clone();
     let runtime_mode_clone = runtime_mode.clone();
     let ubuntu_image_clone = ubuntu_image.clone();
+    let qemu_iso_path_clone = qemu_iso_path.clone();
     let prov_lock = state.provisioning_lock.clone();
     let prov_count = provisioning_guard.release_to_spawn();
     tauri::async_runtime::spawn(async move {
@@ -798,6 +805,7 @@ pub async fn create_agent(
             disk_gb: tmpl.resources.disk_gb,
             runtime_mode: runtime_mode_clone.clone(),
             ubuntu_image: ubuntu_image_clone.clone(),
+            qemu_iso_path: qemu_iso_path_clone.clone(),
         }));
         let docker = agentbox_docker::ContainerRuntime::with_prefix(vm.docker_cmd_prefix());
         // 30-minute timeout prevents agents from being stuck in CREATING forever

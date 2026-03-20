@@ -21,6 +21,7 @@
 //! 启动后通过 SSH + cloud-init 完成 Docker 安装。
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
@@ -202,11 +203,20 @@ impl QemuProvider {
             url,
             dest.display()
         );
-        let output = tokio::process::Command::new("powershell.exe")
+        let mut child = tokio::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-            .output()
-            .await
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .context("PowerShell 下载失败")?;
+
+        let output = match tokio::time::timeout(Duration::from_secs(10 * 60), child.wait_with_output()).await {
+            Ok(result) => result.context("PowerShell 下载失败")?,
+            Err(_) => {
+                let _ = child.kill().await;
+                anyhow::bail!("下载超时（超过10分钟），请检查网络或在部署时选择本地 ISO 文件");
+            }
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("下载失败: {stderr}");
@@ -369,8 +379,19 @@ impl VmProvider for QemuProvider {
 
         // 1. 确保基础 Alpine ISO 存在
         let base_iso = self.base_iso_path();
-        if !base_iso.exists() {
-            info!("首次使用：下载 Alpine Linux 基础镜像（~150 MB）...");
+        if let Some(custom_iso) = config.qemu_iso_path.as_ref().filter(|s| !s.trim().is_empty()) {
+            let custom_iso_path = PathBuf::from(custom_iso);
+            if !custom_iso_path.exists() {
+                anyhow::bail!("指定的 ISO 文件不存在: {}", custom_iso);
+            }
+            if custom_iso_path != base_iso {
+                tokio::fs::copy(&custom_iso_path, &base_iso)
+                    .await
+                    .with_context(|| format!("复制本地 ISO 失败: {}", custom_iso))?;
+            }
+            info!("已使用本地 ISO: {}", custom_iso);
+        } else if !base_iso.exists() {
+            info!("首次使用：下载 Alpine Linux 基础镜像（~150 MB，超时10分钟）...");
             Self::download_file(ALPINE_ISO_URL, &base_iso)
                 .await
                 .context("下载 Alpine Linux 镜像失败")?;

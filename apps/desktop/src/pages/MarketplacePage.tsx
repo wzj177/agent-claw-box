@@ -22,6 +22,7 @@ export function MarketplacePage() {
   const [deployDialog, setDeployDialog] = useState<TemplateInfo | null>(null);
   const [runtimeMode, setRuntimeMode] = useState<"auto" | "wsl" | "qemu">("auto");
   const [ubuntuImage, setUbuntuImage] = useState<"noble" | "jammy" | "ubuntu-22.04-desktop">("noble");
+  const [qemuIsoPath, setQemuIsoPath] = useState("");
 
   useEffect(() => {
     const load = async () => {
@@ -78,6 +79,7 @@ export function MarketplacePage() {
   const openDeployDialog = (template: TemplateInfo) => {
     setRuntimeMode("auto");
     setUbuntuImage("noble");
+    setQemuIsoPath("");
     setDeployDialog(template);
   };
 
@@ -86,6 +88,7 @@ export function MarketplacePage() {
     const opts: CreateAgentOptions = {
       runtime_mode: runtimeMode,
       ubuntu_image: ubuntuImage,
+      qemu_iso_path: qemuIsoPath.trim() || undefined,
     };
     const template = deployDialog;
     setDeployDialog(null);
@@ -233,6 +236,22 @@ export function MarketplacePage() {
                 说明：选择 Desktop 时，若 rootfs 下载失败，会回退使用 `wsl --install -d Ubuntu-22.04`。
               </p>
             </div>
+
+            {(runtimeMode === "qemu" || runtimeMode === "auto") && (
+              <div className="space-y-2">
+                <label className="block text-caption text-neutral-600">QEMU 本地 ISO 文件（可选）</label>
+                <input
+                  type="text"
+                  value={qemuIsoPath}
+                  onChange={(e) => setQemuIsoPath(e.target.value)}
+                  placeholder="例如: C:\\Users\\admin\\Downloads\\alpine-virt.iso"
+                  className="w-full px-3 py-2 text-body bg-white border border-neutral-300 rounded-md focus:outline-none focus:border-primary-400 focus:ring-1 focus:ring-primary-100"
+                />
+                <p className="text-caption text-neutral-400">
+                  不填则自动下载（最长等待 10 分钟）；填写后将优先使用本地 ISO，避免慢速下载。
+                </p>
+              </div>
+            )}
 
             <div className="flex justify-end gap-2 pt-2">
               <button
