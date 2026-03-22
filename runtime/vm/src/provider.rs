@@ -102,4 +102,12 @@ pub trait VmProvider: Send + Sync {
         let _ = name;
         Ok(())
     }
+
+    /// Wait until the VM is fully ready to accept connections (e.g. SSH port open).
+    /// Called by the manager when the VM is already in Running state but connectivity
+    /// is not yet guaranteed. Default is a no-op — override on SSH-based providers.
+    async fn wait_ready(&self, name: &str) -> Result<()> {
+        let _ = name;
+        Ok(())
+    }
 }

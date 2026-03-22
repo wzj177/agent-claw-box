@@ -275,6 +275,21 @@ impl QemuProvider {
         }
     }
 
+    async fn wait_ssh_port_ready(name: &str, max_wait_secs: u64) -> Result<()> {
+        let port = Self::ssh_port(name);
+        let addr = format!("127.0.0.1:{port}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_wait_secs);
+
+        while std::time::Instant::now() < deadline {
+            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+
+        anyhow::bail!("QEMU 启动后 SSH 端口未就绪（{} 秒）", max_wait_secs)
+    }
+
     // ── SSH 命令执行 ──────────────────────────────────────────────────────────
 
     async fn ssh_run(&self, name: &str, cmd: &str) -> Result<String> {
@@ -429,11 +444,16 @@ impl VmProvider for QemuProvider {
         Ok(())
     }
 
+    async fn wait_ready(&self, name: &str) -> Result<()> {
+        Self::wait_ssh_port_ready(name, 120).await
+    }
+
     async fn start(&self, name: &str) -> Result<()> {
-        // 如果进程已在运行则跳过
+        // 如果进程已在运行，等待 SSH 就绪后返回（防止时序竞争）
         if let Some(pid) = self.read_pid(name).await {
             if Self::is_pid_running(pid).await {
-                info!(name, pid, "QEMU VM 已在运行");
+                info!(name, pid, "QEMU VM 已在运行，等待 SSH 端口就绪...");
+                Self::wait_ssh_port_ready(name, 120).await?;
                 return Ok(());
             }
         }
@@ -478,6 +498,7 @@ impl VmProvider for QemuProvider {
         });
 
         info!(name, pid, ssh_port, docker_port, "QEMU VM 已启动");
+        Self::wait_ssh_port_ready(name, 90).await?;
         Ok(())
     }
 

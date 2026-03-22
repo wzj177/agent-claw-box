@@ -100,6 +100,7 @@ impl VmManager {
     fn detect_provider(config: &VmConfig) -> (Arc<dyn VmProvider>, Option<String>) {
         #[cfg(target_os = "macos")]
         {
+            let _ = config;
             (Arc::new(crate::lima::LimaProvider::new()), None)
         }
         #[cfg(target_os = "windows")]
@@ -185,6 +186,7 @@ impl VmManager {
         }
         #[cfg(target_os = "linux")]
         {
+            let _ = config;
             (Arc::new(crate::native::NativeProvider::new()), None)
         }
     }
@@ -267,12 +269,19 @@ impl VmManager {
             VmStatus::NotCreated => {
                 report("正在创建虚拟环境，首次使用需要几分钟...");
                 self.provider.create(&self.config).await?;
+
+                // 新创建的 VM 通常处于 Stopped，需要显式启动后才能继续 provisioning。
+                report("正在启动虚拟环境...");
+                self.provider.start(&self.config.name).await?;
             }
             VmStatus::Stopped => {
                 report("正在启动虚拟环境...");
                 self.provider.start(&self.config.name).await?;
             }
             VmStatus::Running => {
+                report("虚拟环境已就绪，等待连接可用...");
+                // QEMU 等进程可能刚启动，SSH 端口尚未就绪；其他 provider 此方法为 no-op。
+                self.provider.wait_ready(&self.config.name).await?;
                 report("虚拟环境已就绪");
             }
             VmStatus::Starting => {
@@ -290,6 +299,17 @@ impl VmManager {
                 let _ = self.provider.delete(&self.config.name).await;
                 report("正在重新创建虚拟环境...");
                 self.provider.create(&self.config).await?;
+            }
+        }
+
+        // 统一兜底：某些 provider 在 start() 返回后仍需要短暂时间进入 Running。
+        if !matches!(self.provider.status(&self.config.name).await?, VmStatus::Running) {
+            report("虚拟环境启动中，请稍候...");
+            for _ in 0..30 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if let Ok(VmStatus::Running) = self.provider.status(&self.config.name).await {
+                    break;
+                }
             }
         }
 
