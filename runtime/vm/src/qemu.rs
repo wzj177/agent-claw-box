@@ -289,15 +289,34 @@ impl QemuProvider {
     }
 
     async fn wait_ssh_port_ready(name: &str, max_wait_secs: u64) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+
         let port = Self::ssh_port(name);
         let addr = format!("127.0.0.1:{port}");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_wait_secs);
 
+        // QEMU SLIRP 用户态网络会在 QEMU 进程本身启动后立刻接受 TCP 三次握手（由
+        // QEMU 进程处理，而非 Alpine 内部的 sshd），所以仅检查 TCP 可连接性会
+        // 立即返回 Ok，而此时 Alpine 根本还没完成启动。
+        //
+        // 正确做法：连接后尝试读取 SSH banner（第一行以 "SSH-" 开头），
+        // 只有读到 banner 才认为 sshd 真正就绪。
         while std::time::Instant::now() < deadline {
-            if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-                return Ok(());
+            if let Ok(mut stream) = tokio::net::TcpStream::connect(&addr).await {
+                let mut banner = [0u8; 4];
+                let got_banner = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    stream.read_exact(&mut banner),
+                )
+                .await
+                .map(|r| r.map(|_| &banner == b"SSH-").unwrap_or(false))
+                .unwrap_or(false);
+
+                if got_banner {
+                    return Ok(());
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
 
         anyhow::bail!("QEMU 启动后 SSH 端口未就绪（{} 秒）", max_wait_secs)
@@ -530,8 +549,8 @@ impl VmProvider for QemuProvider {
         let ssh_wait_secs = if self.is_tcg_mode(name).await {
             warn!(
                 name,
-                "QEMU 回退至纯软件模拟（TCG），首次启动可能需要 5-10 分钟。\
-                 建议在 Windows 功能中启用 \"Windows 虚拟机监控程序平台\"（WHPX）以获得硬件加速。\
+                "QEMU 回退至纯软件模拟（TCG），首次启动可能需要 5-10 分钟，请耐心等待。\
+                 （云服务器 / 未开启硬件虚拟化的环境属于正常现象）\
                  日志路径: {}",
                 stderr_log.display()
             );
