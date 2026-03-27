@@ -181,6 +181,19 @@ impl QemuProvider {
         self.vms_dir.join("agentbox_qemu_ed25519")
     }
 
+    fn stderr_log_path(&self, name: &str) -> PathBuf {
+        self.vms_dir.join(format!("qemu-{name}.log"))
+    }
+
+    /// 从 QEMU 运行日志检测是否回退到 TCG 软件模拟。
+    async fn is_tcg_mode(&self, name: &str) -> bool {
+        let log_path = self.stderr_log_path(name);
+        tokio::fs::read_to_string(&log_path)
+            .await
+            .map(|s| s.contains("falling back to tcg"))
+            .unwrap_or(false)
+    }
+
     /// 根据 VM 名称哈希计算 SSH 宿主端口（范围 2200-2299）。
     fn ssh_port(name: &str) -> u16 {
         let sum: u32 = name
@@ -445,7 +458,8 @@ impl VmProvider for QemuProvider {
     }
 
     async fn wait_ready(&self, name: &str) -> Result<()> {
-        Self::wait_ssh_port_ready(name, 120).await
+        let secs = if self.is_tcg_mode(name).await { 360 } else { 120 };
+        Self::wait_ssh_port_ready(name, secs).await
     }
 
     async fn start(&self, name: &str) -> Result<()> {
@@ -453,7 +467,8 @@ impl VmProvider for QemuProvider {
         if let Some(pid) = self.read_pid(name).await {
             if Self::is_pid_running(pid).await {
                 info!(name, pid, "QEMU VM 已在运行，等待 SSH 端口就绪...");
-                Self::wait_ssh_port_ready(name, 120).await?;
+                let secs = if self.is_tcg_mode(name).await { 360 } else { 120 };
+                Self::wait_ssh_port_ready(name, secs).await?;
                 return Ok(());
             }
         }
@@ -470,6 +485,12 @@ impl VmProvider for QemuProvider {
         );
 
         let qemu = self.qemu_bin.to_str().unwrap_or("qemu-system-x86_64");
+
+        // 将 QEMU stderr 输出到日志文件，用于后续检测加速器是否回退到 TCG。
+        let stderr_log = self.stderr_log_path(name);
+        let stderr_file = std::fs::File::create(&stderr_log)
+            .context("创建 QEMU 日志文件失败")?;
+
         // Windows 加速器：优先 WHPX（Hyper-V），其次 HAXM，最后 TCG 软件模拟。
         // 不使用 -enable-kvm（Linux 专属标志，Windows 上报 "invalid accelerator kvm"）。
         let child = tokio::process::Command::new(qemu)
@@ -485,6 +506,7 @@ impl VmProvider for QemuProvider {
                 "-parallel", "none",
                 "-machine", "accel=whpx:hax:tcg",
             ])
+            .stderr(stderr_file)
             .spawn()
             .context("启动 QEMU 失败，请确认 QEMU 已正确安装")?;
 
@@ -499,8 +521,27 @@ impl VmProvider for QemuProvider {
             let _ = child.wait().await;
         });
 
-        info!(name, pid, ssh_port, docker_port, "QEMU VM 已启动");
-        Self::wait_ssh_port_ready(name, 90).await?;
+        info!(name, pid, ssh_port, docker_port, "QEMU VM 已启动，检测加速器模式...");
+
+        // 等待 6 秒让 QEMU 完成加速器初始化并将诊断信息写入日志
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        // 根据是否回退到 TCG 模式决定 SSH 等待超时时长
+        let ssh_wait_secs = if self.is_tcg_mode(name).await {
+            warn!(
+                name,
+                "QEMU 回退至纯软件模拟（TCG），首次启动可能需要 5-10 分钟。\
+                 建议在 Windows 功能中启用 \"Windows 虚拟机监控程序平台\"（WHPX）以获得硬件加速。\
+                 日志路径: {}",
+                stderr_log.display()
+            );
+            360u64
+        } else {
+            120u64
+        };
+
+        info!(name, ssh_wait_secs, "等待 SSH 端口就绪...");
+        Self::wait_ssh_port_ready(name, ssh_wait_secs).await?;
         Ok(())
     }
 
