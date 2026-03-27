@@ -332,9 +332,18 @@ impl VmProvider for WslProvider {
                 if lower.contains("hcs_e_hyperv_not_installed")
                     || lower.contains("enablevirtualization")
                     || lower.contains("registerdistro/createvm")
+                    || lower.contains("不支持 wsl")
                 {
                     anyhow::bail!(
-                        "WSL2 无法创建虚拟机（缺少 Hyper-V / 未开启 BIOS 虚拟化）。\n请二选一：\n1) 在 BIOS 启用 VT-x/AMD-V 并开启 Windows 虚拟化组件后重试；\n2) 直接使用 QEMU 模式（无需 WSL）。\n原始输出:\nstdout: {stdout}\nstderr: {stderr}"
+                        "WSL2 无法创建虚拟机（宿主机不支持嵌套虚拟化 / 缺少 Hyper-V）。\n\
+                         常见原因：\n\
+                         • 云服务器（阿里云 / 腾讯云 / AWS / Azure 等）实例默认不开启嵌套虚拟化\n\
+                         • Windows 物理机 BIOS 中未启用 VT-x / AMD-V\n\
+                         解决方法：\n\
+                         1) 云服务器 → 联系云厂商开启嵌套虚拟化，或改用裸金属 / 支持嵌套虚拟化的机型；\n\
+                         2) 物理机 → 在 BIOS 启用虚拟化后，执行：wsl --install --no-distribution；\n\
+                         3) 改用 QEMU 模式（无需 WSL / Hyper-V）→ 删除本实例，重新部署时在运行时选项中选择「QEMU」。\n\
+                         原始输出:\nstdout: {stdout}\nstderr: {stderr}"
                     );
                 }
                 anyhow::bail!("WSL import failed:\nstdout: {stdout}\nstderr: {stderr}");

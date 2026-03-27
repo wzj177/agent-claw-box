@@ -126,8 +126,14 @@ impl VmManager {
                 .map(|o| o.status.success())
                 .unwrap_or(false);
 
+            // 用 `wsl --list --quiet` 而非 `wsl --status` 来检测 HCS 可用性。
+            // `wsl --status` 不触发 HCS（Hyper-V Container Service）层，即使嵌套虚拟化
+            // 不可用（如云服务器 / 禁用 Hyper-V 的主机）也会返回退出码 0，导致误判为可用。
+            // `wsl --list --quiet` 会真正访问 HCS，在不支持嵌套虚拟化的环境下会在
+            // stdout/stderr 中输出 HCS_E_HYPERV_NOT_INSTALLED 等关键词。
+            // 注意：不检查 exit code，因为无 distro 时也会返回非 0，但 HCS 是正常的。
             let wsl_can_create_vm = std::process::Command::new("wsl.exe")
-                .arg("--status")
+                .args(["--list", "--quiet"])
                 .output()
                 .ok()
                 .map(|o| {
@@ -137,12 +143,13 @@ impl VmManager {
                     all.push_str(&Self::decode_windows_output(&o.stderr));
                     let lower = all.to_lowercase();
 
-                    // 典型不可用场景：HCS_E_HYPERV_NOT_INSTALLED / 提示开启虚拟化
+                    // 任何 HCS / 嵌套虚拟化不可用信号
                     let hyperv_missing = lower.contains("hcs_e_hyperv_not_installed")
                         || lower.contains("enablevirtualization")
-                        || lower.contains("registerdistro/createvm");
+                        || lower.contains("registerdistro/createvm")
+                        || lower.contains("不支持 wsl");
 
-                    o.status.success() && !hyperv_missing
+                    !hyperv_missing
                 })
                 .unwrap_or(false);
 
