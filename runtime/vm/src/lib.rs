@@ -46,7 +46,7 @@ impl Default for VmConfig {
             memory_mb: 4096,
             disk_gb: 20,
             runtime_mode: None,
-            ubuntu_image: None,
+            ubuntu_image: Some("ubuntu-lts".to_string()),
             qemu_iso_path: None,
         }
     }

@@ -312,7 +312,7 @@ function ConfigFieldInput({
     dynamicEnvHint = providerMeta.envVar;
     dynamicPlaceholder = providerMeta.hint;
     if (selectedProvider === "ollama") {
-      helperText = "Ollama 为本地模型，填入任意值即可（如 ollama）";
+      helperText = "Ollama 为本地模型，API Key 可留空";
     } else {
       helperText = providerMeta.hint;
     }

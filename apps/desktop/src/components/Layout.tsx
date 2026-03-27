@@ -1,16 +1,28 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { Box, Store, UserCircle2, LifeBuoy } from "lucide-react";
+import { Box, Store, UserCircle2, LifeBuoy, Settings } from "lucide-react";
 
 export function Layout() {
   return (
     <div className="flex h-screen">
       {/* Sidebar */}
       <aside className="w-56 bg-white border-r border-neutral-200 flex flex-col shrink-0">
-        <div className="h-14 px-5 flex items-center gap-2.5 border-b border-neutral-200">
-          <div className="w-8 h-8 rounded-lg bg-primary-500 flex items-center justify-center">
-            <Box className="w-4.5 h-4.5 text-white" />
+        <div className="h-14 px-5 flex items-center justify-between gap-2.5 border-b border-neutral-200">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-primary-500 flex items-center justify-center">
+              <Box className="w-4.5 h-4.5 text-white" />
+            </div>
+            <span className="text-base font-semibold text-neutral-800 tracking-tight">AgentClawBox</span>
           </div>
-          <span className="text-base font-semibold text-neutral-800 tracking-tight">AgentClawBox</span>
+          <NavLink
+            to="/settings"
+            className={({ isActive }) =>
+              `btn-text shrink-0 ${isActive ? "text-primary-500 bg-primary-50 hover:bg-primary-50" : ""}`
+            }
+            title="设置"
+            aria-label="设置"
+          >
+            <Settings className="w-4 h-4" />
+          </NavLink>
         </div>
 
         <nav className="flex-1 py-2 px-3 space-y-0.5">

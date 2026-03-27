@@ -3,6 +3,7 @@
 ## 目录
 
 - [安装相关](#安装相关)
+- [Windows 专题：WSL / QEMU / 图形界面](#windows-专题wsl--qemu--图形界面)
 - [环境初始化](#环境初始化)
 - [部署问题](#部署问题)
 - [运行问题](#运行问题)
@@ -36,25 +37,13 @@ brew install lima
 | 系统已有 WSL 2 | 自动使用 WSL 2（性能更好） |
 | 未启用 WSL 2 | 自动切换到 QEMU 模式（无需任何手动配置） |
 
-**如果想手动启用 WSL 2**（推荐，性能更好），以管理员身份打开 PowerShell 执行：
-
-```powershell
-wsl --install
-```
-
-安装完成后需要重启电脑。
+详细安装步骤请参阅下方 [Windows 专题：WSL 安装](#q-如何在-windows-上安装-wsl-2) 章节。
 
 ### Q: QEMU 模式是什么？需要额外安装吗？
 
 QEMU 是一种轻量级虚拟机方案，用于在**未启用 WSL 2 的 Windows**（如 Windows Home、公司禁用 Hyper-V 的环境）上运行 Agent。
 
-AgentClawBox 会提示你安装 QEMU，推荐使用：
-
-```powershell
-winget install qemu
-```
-
-或前往 [https://www.qemu.org/download/#windows](https://www.qemu.org/download/#windows) 下载安装包。安装后重启 AgentClawBox 即可。
+详细安装步骤请参阅下方 [Windows 专题：QEMU 安装](#q-如何安装-qemu) 章节。
 
 > QEMU 模式首次使用需要下载约 150 MB 的 Alpine Linux 基础镜像，之后每次启动无需重新下载。
 
@@ -68,6 +57,155 @@ sudo usermod -aG docker $USER
 ```
 
 注销并重新登录后生效。
+
+---
+
+## Windows 专题：WSL / QEMU / 图形界面
+
+### Q: 如何在 Windows 上安装 WSL 2？
+
+> **适用系统**：Windows 10 版本 2004（Build 19041）及以上 / Windows 11
+
+**步骤 1：以管理员身份打开 PowerShell**
+
+右键点击「开始菜单」→「Windows Terminal（管理员）」或「PowerShell（管理员）」。
+
+**步骤 2：一键安装**
+
+```powershell
+wsl --install
+```
+
+此命令会自动完成：
+- 启用"适用于 Linux 的 Windows 子系统"功能
+- 启用"虚拟机平台"功能
+- 下载并安装 WSL 2 Linux 内核
+- 安装默认的 Ubuntu 发行版
+
+**步骤 3：重启电脑**
+
+安装完成后**必须重启**，重启后 Ubuntu 会自动完成初始化，设置 Linux 用户名和密码即可。
+
+**验证安装**
+
+```powershell
+wsl --list --verbose
+```
+
+看到 `Ubuntu` 且版本显示为 `2` 即表示安装成功。
+
+> **遇到问题？**
+> - 报错"虚拟化未启用"：进入 BIOS/UEFI，开启 **VT-x**（Intel）或 **AMD-V**（AMD）。
+> - 公司设备可能禁用了 Hyper-V，此时请改用 **QEMU 模式**，无需 WSL。
+> - 参考微软官方文档：[https://learn.microsoft.com/zh-cn/windows/wsl/install](https://learn.microsoft.com/zh-cn/windows/wsl/install)
+
+---
+
+### Q: 如何安装 QEMU？
+
+> QEMU 用于在**未开启 WSL 2** 的 Windows 上运行 Agent，或在需要完整 VM 隔离的场景下使用。
+
+**方法一：通过 winget 安装（推荐）**
+
+以管理员身份打开 PowerShell，执行：
+
+```powershell
+winget install --id QEMU.QEMU -e
+```
+
+安装完成后**重启 AgentClawBox** 即自动识别。
+
+**方法二：手动下载安装包**
+
+1. 前往 [https://www.qemu.org/download/#windows](https://www.qemu.org/download/#windows)
+2. 下载最新版 64-bit Windows 安装包（`.exe`）
+3. 按向导安装，安装路径建议保持默认（`C:\Program Files\qemu`）
+4. 安装完成后重启 AgentClawBox
+
+**验证安装**
+
+```powershell
+qemu-system-x86_64.exe --version
+```
+
+能看到版本号即安装成功。
+
+> **注意**：QEMU 同样需要 CPU 虚拟化支持（VT-x / AMD-V）。如果 BIOS 中未开启，QEMU 会回退到纯软件模拟，速度会明显变慢。
+
+---
+
+### Q: Windows 11 如何使用图形界面（GUI）运行 Ubuntu Desktop？
+
+> **适用系统**：Windows 11（Build 22000 及以上）
+> **技术**：WSLg（Linux GUI 应用原生支持）
+> **无需**：VNC、RDP、xrdp 等额外远程桌面协议
+
+Windows 11 内置了 **WSLg**，可以让 WSL 2 中的 Linux 图形应用直接在 Windows 桌面上弹出窗口，无需任何额外配置。
+
+#### 前提条件
+
+1. 系统为 **Windows 11**（右键「此电脑」→「属性」确认版本 Build ≥ 22000）
+2. WSL 2 已正确安装（见上方 WSL 安装教程）
+3. 已安装支持 WSLg 的显卡驱动：
+   - NVIDIA：驱动版本 ≥ 470.76
+   - AMD：驱动版本 ≥ 21.10
+   - Intel：驱动版本 ≥ 30.0.100.9684
+
+#### 步骤 1：更新 WSL 到最新版本
+
+```powershell
+wsl --update
+```
+
+#### 步骤 2：在 AgentClawBox 中部署 Ubuntu Desktop 实例
+
+1. 进入「应用市场」，选择模板后点击「部署」
+2. 在部署选项中，**Ubuntu 镜像** 选择「Ubuntu Desktop 22.04（WSL 图形界面）」
+3. 点击「确认部署」
+
+> ⚠️ 此选项仅在检测到 **Windows 11** 时才显示，Windows 10 不会出现该选项。
+
+#### 步骤 3：在实例内安装桌面环境
+
+部署完成后，点击实例卡片的「本地终端」进入该实例，执行：
+
+```bash
+# 更新软件源
+sudo apt update
+
+# 安装轻量桌面（推荐 XFCE，资源占用少）
+sudo apt install -y xfce4 xfce4-goodies
+
+# 或安装完整 GNOME 桌面（需要更多内存）
+# sudo apt install -y ubuntu-desktop
+```
+
+安装过程根据网速约需 5-15 分钟。
+
+#### 步骤 4：启动桌面
+
+安装完成后，在同一终端执行：
+
+```bash
+startxfce4
+```
+
+XFCE 桌面窗口会直接出现在 Windows 桌面上，和普通 Windows 程序窗口一样操作。
+
+#### 常见问题
+
+| 问题 | 解决方法 |
+|------|----------|
+| 部署选项中没有「Ubuntu Desktop」 | 系统不是 Windows 11，不支持 WSLg |
+| 启动报错 `cannot connect to X server` | 执行 `wsl --update` 更新 WSL，然后重启 WSL |
+| 桌面卡顿或花屏 | 更新显卡驱动到支持 WSLg 的版本 |
+| `xfce4` 安装失败 | 先运行 `sudo apt update && sudo apt upgrade -y`，再重试 |
+| 窗口中文显示方块 | 安装字体：`sudo apt install -y fonts-noto-cjk` |
+
+#### 参考资料
+
+- 微软官方教程：[在 WSL 上运行 Linux GUI 应用](https://learn.microsoft.com/zh-cn/windows/wsl/tutorials/gui-apps)
+- WSLg GitHub 项目：[https://github.com/microsoft/wslg](https://github.com/microsoft/wslg)
 
 ---
 

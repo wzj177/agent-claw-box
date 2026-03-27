@@ -37,6 +37,10 @@ pub fn run() {
             // Must use tauri::async_runtime — setup() does NOT run in a Tokio context.
             let state = tauri::async_runtime::block_on(async { AppState::init().await })?;
 
+            if let Err(e) = tauri::async_runtime::block_on(async { commands::apply_saved_proxy_env(&state).await }) {
+                tracing::warn!(error = %e, "Failed to apply saved proxy settings");
+            }
+
             // Background: ensure VM is ready → update docker prefix → auto-start agents → collect metrics
             let state_clone = state.clone();
             let app_handle = app.handle().clone();
@@ -111,6 +115,10 @@ pub fn run() {
             commands::set_auto_start,
             commands::get_health_reports,
             commands::get_agent_metrics,
+            commands::get_app_settings,
+            commands::save_app_settings,
+            commands::clear_local_logs,
+            commands::get_proxy_preview,
             commands::open_agent_shell,
             commands::run_agent_shell_command,
             commands::list_templates,
@@ -119,8 +127,10 @@ pub fn run() {
             commands::save_agent_config,
             commands::apply_agent_config,
             commands::export_agent_data,
+            commands::export_openclaw_config,
+            commands::save_exported_file,
             commands::import_agent_data,
-            commands::upgrade_agent,
+            commands::copy_agent_vm,
             commands::list_agent_backups,
             commands::get_ssh_info,
             commands::pty_spawn,

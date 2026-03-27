@@ -161,7 +161,13 @@ impl VmProvider for NativeProvider {
 
         let status = child.wait().await?;
         if !status.success() {
-            anyhow::bail!("Command failed (exit {:?}): {}", status.code(), stderr_text);
+            let output_info = match (collected.is_empty(), stderr_text.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => stderr_text,
+                (false, true) => collected,
+                (false, false) => format!("stdout:\n{collected}\nstderr:\n{stderr_text}"),
+            };
+            anyhow::bail!("Command failed (exit {:?}): {}", status.code(), output_info);
         }
         Ok(collected.trim().to_string())
     }

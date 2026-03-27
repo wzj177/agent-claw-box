@@ -10,13 +10,16 @@ import {
   Power,
   PowerOff,
   Settings,
-  ArrowUpCircle,
-  Download,
+  Copy,
   ScrollText,
   Loader2,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+import { open as shellOpen } from "@tauri-apps/plugin-shell";
 import { api, type AgentInfo, type AgentStatus, type HealthReport, type TemplateInfo } from "../lib/api";
+
+const isMac = navigator.userAgent.toLowerCase().includes("mac");
+const isWindows = navigator.userAgent.toLowerCase().includes("windows");
 
 export function AgentsPage() {
   const [agents, setAgents] = useState<AgentInfo[]>([]);
@@ -130,6 +133,7 @@ function AgentCard({
     if (image.includes("jammy") || image.includes("22.04")) return "Ubuntu 22.04";
     return agent.ubuntu_image ?? "默认";
   })();
+  const usesDesktopUbuntu = (agent.ubuntu_image ?? "").toLowerCase().includes("desktop");
 
   // Check if required config fields are filled
   useEffect(() => {
@@ -200,21 +204,7 @@ function AgentCard({
   const handleStart = run(() => api.startAgent(agent.id));
   const handleStop = run(() => api.stopAgent(agent.id));
   const handleToggleAutoStart = run(() => api.setAutoStart(agent.id, !agent.auto_start));
-  const handleUpgrade = run(() => api.upgradeAgent(agent.id).then(() => undefined));
-
-  const handleExport = async () => {
-    if (busy) return;
-    setBusy(true);
-    setToast(null);
-    try {
-      const path = await api.exportAgentData(agent.id);
-      setToast({ msg: `备份已导出至: ${path}`, ok: true });
-    } catch (e) {
-      setToast({ msg: `导出失败: ${e}`, ok: false });
-    } finally {
-      setBusy(false);
-    }
-  };
+  const handleCopyVm = run(() => api.copyAgentVm(agent.id).then(() => undefined));
 
   const handleDeleteClick = async () => {
     if (busy) return;
@@ -290,6 +280,14 @@ function AgentCard({
         <InfoRow label="运行模式" value={runtimeModeLabel} />
         <InfoRow label="Ubuntu 镜像" value={ubuntuImageLabel} />
         <InfoRow label="开机自启" value={agent.auto_start ? "已开启" : "未开启"} />
+        {isWindows && usesDesktopUbuntu && (
+          <InfoRow
+            label="Linux GUI"
+            value="WSLg 教程↗"
+            valueClass="text-blue-600 cursor-pointer hover:underline"
+            onClick={() => shellOpen("https://learn.microsoft.com/zh-cn/windows/wsl/tutorials/gui-apps")}
+          />
+        )}
         {agent.install_method === "native" && (
           <InfoRow label="SSH" value={`ssh ${agent.vm_name}`} valueClass="text-xs font-mono select-all" />
         )}
@@ -333,9 +331,11 @@ function AgentCard({
         <button onClick={handleShellLocal} disabled={busy || isTransitioning} className="btn-text" title="打开本地终端">
           <Terminal className="w-3.5 h-3.5" />
         </button>
-        <button onClick={handleShellWeb} disabled={busy || isTransitioning} className="btn-text" title="Web Shell">
-          <Monitor className="w-3.5 h-3.5" />
-        </button>
+        {!isMac && (
+          <button onClick={handleShellWeb} disabled={busy || isTransitioning} className="btn-text" title="Web Shell">
+            <Monitor className="w-3.5 h-3.5" />
+          </button>
+        )}
         <button onClick={() => navigate(`/agent/${agent.id}`)} className="btn-text" title="日志与监控">
           <ScrollText className="w-3.5 h-3.5" />
         </button>
@@ -345,11 +345,8 @@ function AgentCard({
         <button onClick={() => navigate(`/config/${agent.id}`)} className="btn-text" title="配置">
           <Settings className="w-3.5 h-3.5" />
         </button>
-        <button onClick={handleExport} disabled={busy || isTransitioning} className="btn-text" title="导出备份">
-          <Download className="w-3.5 h-3.5" />
-        </button>
-        <button onClick={handleUpgrade} disabled={busy || isTransitioning} className="btn-text" title="升级">
-          <ArrowUpCircle className="w-3.5 h-3.5" />
+        <button onClick={handleCopyVm} disabled={busy || isTransitioning} className="btn-text" title="复制实例">
+          <Copy className="w-3.5 h-3.5" />
         </button>
         <button onClick={handleToggleAutoStart} disabled={busy || isTransitioning} className="btn-text" title="切换开机自启">
           {agent.auto_start
@@ -385,6 +382,19 @@ function AgentCard({
       <div className="px-4 py-2 text-caption border-t border-red-100 bg-red-50 text-red-600">
         {isCreating ? "取消创建会删除已创建的半成品虚拟机，且不可恢复。" : "删除实例会彻底删除对应虚拟机，删除后不可恢复。"}
       </div>
+
+      {isWindows && usesDesktopUbuntu && (
+        <div className="px-4 py-2 text-caption border-t border-blue-100 bg-blue-50 text-blue-700 flex items-center gap-1.5">
+          <span>Windows 11 内置 WSLg 可直接运行 Linux GUI，无需远程桌面协议。</span>
+          <button
+            type="button"
+            onClick={() => shellOpen("https://learn.microsoft.com/zh-cn/windows/wsl/tutorials/gui-apps")}
+            className="inline-flex items-center gap-0.5 underline underline-offset-2 hover:text-blue-900"
+          >
+            <ExternalLink className="w-3 h-3" />查看教程
+          </button>
+        </div>
+      )}
 
       {/* Config overlay */}
       {showConfigOverlay && needsConfig && (
@@ -434,15 +444,17 @@ function InfoRow({
   label,
   value,
   valueClass = "text-neutral-700",
+  onClick,
 }: {
   label: string;
   value: string;
   valueClass?: string;
+  onClick?: () => void;
 }) {
   return (
     <div className="flex items-center justify-between text-caption">
       <span className="text-neutral-400">{label}</span>
-      <span className={valueClass}>{value}</span>
+      <span className={valueClass} onClick={onClick}>{value}</span>
     </div>
   );
 }

@@ -79,6 +79,8 @@ export interface SystemInfo {
   free_disk_gb: number;
   max_instances: number;
   max_running: number;
+  /** Windows 11 (build >= 22000) 支持 WSLg，可直接运行 Linux GUI 应用。其他平台均为 false。 */
+  wsl_gui_supported: boolean;
 }
 
 export interface AgentConfigEntry {
@@ -106,6 +108,28 @@ export interface CreateAgentOptions {
   runtime_mode?: "auto" | "wsl" | "qemu";
   ubuntu_image?: "noble" | "jammy" | "ubuntu-22.04-desktop";
   qemu_iso_path?: string;
+}
+
+export interface AppSettings {
+  instance_autostart_enabled: boolean;
+  instance_autostart_delay_secs: number;
+  proxy_enabled: boolean;
+  proxy_url: string | null;
+  no_proxy: string | null;
+}
+
+export interface LogCleanupResult {
+  removed_native_logs: number;
+  removed_pid_files: number;
+  removed_metrics_rows: number;
+}
+
+export interface ProxyPreview {
+  current_platform: string;
+  original: string | null;
+  lima_preview: string | null;
+  wsl_preview: string | null;
+  qemu_preview: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +174,16 @@ export const api = {
 
   getSystemInfo: () => invoke<SystemInfo>("get_system_info"),
 
+  getAppSettings: () => invoke<AppSettings>("get_app_settings"),
+
+  saveAppSettings: (settings: AppSettings) =>
+    invoke<void>("save_app_settings", { settings }),
+
+  clearLocalLogs: () => invoke<LogCleanupResult>("clear_local_logs"),
+
+  getProxyPreview: (proxyUrl?: string | null) =>
+    invoke<ProxyPreview>("get_proxy_preview", { proxyUrl }),
+
   getAgentConfig: (id: string) =>
     invoke<AgentConfigEntry[]>("get_agent_config", { id }),
 
@@ -162,11 +196,17 @@ export const api = {
   exportAgentData: (id: string) =>
     invoke<string>("export_agent_data", { id }),
 
+  exportOpenClawConfig: (id: string) =>
+    invoke<string>("export_openclaw_config", { id }),
+
+  saveExportedFile: (sourcePath: string, targetPath: string) =>
+    invoke<string>("save_exported_file", { sourcePath, targetPath }),
+
   importAgentData: (id: string, backupPath: string) =>
     invoke<void>("import_agent_data", { id, backupPath }),
 
-  upgradeAgent: (id: string) =>
-    invoke<AgentInfo>("upgrade_agent", { id }),
+  copyAgentVm: (id: string) =>
+    invoke<AgentInfo>("copy_agent_vm", { id }),
 
   listAgentBackups: (id: string) =>
     invoke<AgentBackup[]>("list_agent_backups", { id }),

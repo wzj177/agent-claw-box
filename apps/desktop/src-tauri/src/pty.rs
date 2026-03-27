@@ -55,6 +55,7 @@ impl PtySessionManager {
         session_id: String,
         agent_id: String,
         command: Vec<String>,
+        initial_input: Option<String>,
         rows: u16,
         cols: u16,
         app: AppHandle,
@@ -113,6 +114,19 @@ impl PtySessionManager {
 
         sessions.insert(session_id.clone(), session);
         drop(sessions);
+
+        if let Some(initial_input) = initial_input {
+            let sessions_ref = self.sessions.clone();
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if let Some(session) = sessions_ref.lock().await.get_mut(&sid) {
+                    let _ = session.writer.write_all(initial_input.as_bytes());
+                    let _ = session.writer.flush();
+                    session.last_active = Instant::now();
+                }
+            });
+        }
 
         // Spawn a background thread to read PTY output and emit events
         let sid = session_id.clone();

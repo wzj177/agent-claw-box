@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
-import { Download, Search, Cpu, HardDrive, MemoryStick, FolderOpen } from "lucide-react";
+import { Download, Search, Cpu, HardDrive, MemoryStick, FolderOpen, ExternalLink } from "lucide-react";
 import { api, type TemplateInfo, type SystemInfo, type CreateAgentOptions } from "../lib/api";
 import { useNavigate } from "react-router-dom";
 import { open } from "@tauri-apps/plugin-dialog";
+import { open as shellOpen } from "@tauri-apps/plugin-shell";
 
 const INSTALL_METHOD_LABELS: Record<string, string> = {
   docker: "Docker 镜像",
@@ -10,6 +11,8 @@ const INSTALL_METHOD_LABELS: Record<string, string> = {
   script: "自定义构建",
   native: "原生安装",
 };
+
+const isWindows = navigator.userAgent.toLowerCase().includes("windows");
 
 export function MarketplacePage() {
   const navigate = useNavigate();
@@ -78,6 +81,11 @@ export function MarketplacePage() {
   };
 
   const openDeployDialog = (template: TemplateInfo) => {
+    if (!isWindows) {
+      // macOS / Linux：直接部署，不弹选项框
+      handleDeploy(template);
+      return;
+    }
     setRuntimeMode("auto");
     setUbuntuImage("noble");
     setQemuIsoPath("");
@@ -216,7 +224,7 @@ export function MarketplacePage() {
             <div>
               <h3 className="text-base font-semibold text-neutral-800">部署 {deployDialog.name}</h3>
               <p className="text-caption text-neutral-500 mt-1">
-                请选择运行模式和 Ubuntu 镜像（仅 Windows 生效，其他系统自动忽略）。
+                请选择运行模式和 Ubuntu 镜像版本。
               </p>
             </div>
 
@@ -242,11 +250,26 @@ export function MarketplacePage() {
               >
                 <option value="noble">Ubuntu 24.04（Noble，默认）</option>
                 <option value="jammy">Ubuntu 22.04（Jammy，稳定）</option>
-                <option value="ubuntu-22.04-desktop">Ubuntu Desktop 22.04（WSL 商店）</option>
+                {systemInfo?.wsl_gui_supported && (
+                  <option value="ubuntu-22.04-desktop">Ubuntu Desktop 22.04（WSL 图形界面）</option>
+                )}
               </select>
-              <p className="text-caption text-neutral-400">
-                说明：选择 Desktop 时，若 rootfs 下载失败，会回退使用 `wsl --install -d Ubuntu-22.04`。
-              </p>
+              {systemInfo?.wsl_gui_supported && ubuntuImage === "ubuntu-22.04-desktop" && (
+                <div className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2.5 space-y-1.5">
+                  <p className="text-caption text-blue-800 font-medium">Windows 11 支持原生运行 Linux 图形界面（WSLg）</p>
+                  <p className="text-caption text-blue-700">
+                    该选项仅安装带桂面的 Ubuntu rootfs。WSLg 不需要远程桌面协议，可直接展示 Linux GUI 窗口。
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => shellOpen("https://learn.microsoft.com/zh-cn/windows/wsl/tutorials/gui-apps")}
+                    className="inline-flex items-center gap-1 text-caption text-blue-600 hover:text-blue-800 underline underline-offset-2"
+                  >
+                    <ExternalLink className="w-3 h-3" />
+                    查看官方教程：在 WSL 上运行 Linux GUI 应用
+                  </button>
+                </div>
+              )}
             </div>
 
             {(runtimeMode === "qemu" || runtimeMode === "auto") && (

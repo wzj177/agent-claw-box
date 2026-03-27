@@ -69,7 +69,7 @@ export function AgentDetailPage() {
       {/* Tab content */}
       <div className="flex-1 min-h-0">
         {tab === "logs" && <LogsPanel agentId={id} />}
-        {tab === "metrics" && <MetricsPanel agentId={id} />}
+        {tab === "metrics" && <MetricsPanel agentId={id} agent={agent} />}
       </div>
     </div>
   );
@@ -206,7 +206,13 @@ function LogsPanel({ agentId }: { agentId: string }) {
 // Metrics panel
 // ---------------------------------------------------------------------------
 
-function MetricsPanel({ agentId }: { agentId: string }) {
+function MetricsPanel({
+  agentId,
+  agent,
+}: {
+  agentId: string;
+  agent: AgentInfo | null;
+}) {
   const [metrics, setMetrics] = useState<AgentMetrics[]>([]);
   const [loading, setLoading] = useState(false);
 
@@ -233,8 +239,27 @@ function MetricsPanel({ agentId }: { agentId: string }) {
 
   return (
     <div className="space-y-6">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium text-neutral-700">实例监控</p>
+          <p className="text-caption text-neutral-400">
+            每 30 秒刷新一次最新指标
+          </p>
+        </div>
+        <button onClick={fetchMetrics} className="btn-text" title="刷新监控">
+          <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
+          <span className="text-caption">刷新</span>
+        </button>
+      </div>
+
+      {agent?.install_method === "native" && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          当前原生实例已接入 CPU、内存、健康状态和网络累计流量采集。网络指标为实例启动后的累计值。
+        </div>
+      )}
+
       {/* Summary cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
         <StatCard
           icon={<Cpu className="w-5 h-5 text-blue-500" />}
           label="CPU 使用率"
@@ -254,6 +279,11 @@ function MetricsPanel({ agentId }: { agentId: string }) {
           icon={<ArrowDownUp className="w-5 h-5 text-orange-500" />}
           label="网络发送"
           value={latest ? formatKB(latest.net_tx_kb) : "--"}
+        />
+        <StatCard
+          icon={<Activity className={`w-5 h-5 ${latest?.healthy ? "text-emerald-500" : "text-rose-500"}`} />}
+          label="健康状态"
+          value={latest ? (latest.healthy ? "正常" : "异常") : "--"}
         />
       </div>
 

@@ -470,6 +470,8 @@ impl VmProvider for QemuProvider {
         );
 
         let qemu = self.qemu_bin.to_str().unwrap_or("qemu-system-x86_64");
+        // Windows 加速器：优先 WHPX（Hyper-V），其次 HAXM，最后 TCG 软件模拟。
+        // 不使用 -enable-kvm（Linux 专属标志，Windows 上报 "invalid accelerator kvm"）。
         let child = tokio::process::Command::new(qemu)
             .args([
                 "-m", &memory,
@@ -481,7 +483,7 @@ impl VmProvider for QemuProvider {
                 "-nographic",
                 "-serial", "none",
                 "-parallel", "none",
-                "-enable-kvm",   // 需要 Windows 开启 HAXM 或 WHPX
+                "-machine", "accel=whpx:hax:tcg",
             ])
             .spawn()
             .context("启动 QEMU 失败，请确认 QEMU 已正确安装")?;

@@ -10,6 +10,7 @@ import { DocViewerPage } from "./pages/DocViewerPage";
 import { ConfigPage } from "./pages/ConfigPage";
 import { AgentDetailPage } from "./pages/AgentDetailPage";
 import { WebShellPage } from "./pages/WebShellPage";
+import { SettingsPage } from "./pages/SettingsPage";
 
 export default function App() {
   const [ready, setReady] = useState(false);
@@ -26,6 +27,7 @@ export default function App() {
             <Route path="/help" element={<HelpCenterPage />} />
             <Route path="/docs/:slug" element={<DocViewerPage />} />
             <Route path="/about" element={<AboutPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
             <Route path="/config/:id" element={<ConfigPage />} />
             <Route path="/agent/:id" element={<AgentDetailPage />} />
             <Route path="/shell/:id" element={<WebShellPage />} />

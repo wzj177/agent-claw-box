@@ -108,7 +108,15 @@ impl LimaProvider {
 
         let status = child.wait().await?;
         if !status.success() {
-            anyhow::bail!("VM command failed (exit {:?}): {}", status.code(), stderr_text);
+            // Include both stdout and stderr so callers (e.g. long install scripts that
+            // write errors to stdout rather than stderr) can see the actual failure reason.
+            let output_info = match (collected.is_empty(), stderr_text.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => stderr_text,
+                (false, true) => collected,
+                (false, false) => format!("stdout:\n{collected}\nstderr:\n{stderr_text}"),
+            };
+            anyhow::bail!("VM command failed (exit {:?}): {}", status.code(), output_info);
         }
 
         Ok(collected.trim().to_string())
@@ -335,7 +343,16 @@ impl VmProvider for LimaProvider {
     }
 
     async fn create(&self, config: &VmConfig) -> Result<()> {
-        info!(name = %config.name, "Creating Lima VM (default Ubuntu)");
+        let template = match config.ubuntu_image.as_deref() {
+            Some("jammy") | Some("ubuntu-22.04") | Some("ubuntu-22.04-desktop") => "template:ubuntu-22.04",
+            Some("ubuntu-lts") | Some("noble") | Some("ubuntu-24.04") | None => "template:ubuntu-lts",
+            Some(other) => {
+                tracing::warn!(name = %config.name, requested = %other, "Unknown Ubuntu image for Lima, falling back to ubuntu-lts");
+                "template:ubuntu-lts"
+            }
+        };
+
+        info!(name = %config.name, template, "Creating Lima VM (Ubuntu LTS)");
 
         // Use Lima's default template (plain Ubuntu) — lightweight, no cloud-init Docker.
         // Docker will be installed on-demand when a Docker-based agent is deployed.
@@ -351,7 +368,7 @@ impl VmProvider for LimaProvider {
                 &format!("--set=.cpus={cpus}"),
                 &format!("--set=.memory=\"{memory}\""),
                 &format!("--set=.disk=\"{disk}\""),
-                "template://default",
+                template,
             ])
             .output()
             .await

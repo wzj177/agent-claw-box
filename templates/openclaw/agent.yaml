@@ -7,11 +7,79 @@ install_method: native
 runtime:
   install_cmd: |
     set -euo pipefail
+    export PATH="$HOME/.npm-global/bin:$HOME/.local/node/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+    mkdir -p "$HOME/.local" "$HOME/.npm-global"
+
+    install_node_binary() {
+      need_node=1
+      if command -v node >/dev/null 2>&1; then
+        node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+        node_minor="$(node -p 'process.versions.node.split(".")[1]' 2>/dev/null || echo 0)"
+        if [ "$node_major" -ge 24 ] || { [ "$node_major" -eq 22 ] && [ "$node_minor" -ge 16 ]; }; then
+          need_node=0
+        fi
+      fi
+
+      if [ "$need_node" = "0" ]; then
+        return 0
+      fi
+
+      echo "Installing Node.js from official binary (prefer 24, fallback 22)..."
+      arch="$(uname -m)"
+      case "$arch" in
+        x86_64|amd64) node_arch="x64" ;;
+        aarch64|arm64) node_arch="arm64" ;;
+        *)
+          echo "Unsupported architecture: $arch" >&2
+          return 1
+          ;;
+      esac
+
+      node_channel=""
+      node_file=""
+      for channel in latest-v24.x latest-v22.x; do
+        candidate="$(curl -fsSL "https://nodejs.org/dist/${channel}/SHASUMS256.txt" --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 --max-time 300 | awk '/linux-'"$node_arch"'\.tar\.xz$/ { print $2; exit }' || true)"
+        if [ -n "$candidate" ]; then
+          node_channel="$channel"
+          node_file="$candidate"
+          break
+        fi
+      done
+      if [ -z "$node_file" ]; then
+        echo "Failed to resolve Node.js binary for $node_arch" >&2
+        return 1
+      fi
+
+      tmp_dir="$(mktemp -d)"
+      trap 'rm -rf "$tmp_dir"' EXIT
+      curl -fL "https://nodejs.org/dist/${node_channel}/$node_file" -o "$tmp_dir/node.tar.xz" --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 --max-time 300
+      tar -xJf "$tmp_dir/node.tar.xz" -C "$tmp_dir"
+      rm -rf "$HOME/.local/node"
+      mv "$tmp_dir/${node_file%.tar.xz}" "$HOME/.local/node"
+      export PATH="$HOME/.local/node/bin:$PATH"
+      hash -r
+      rm -rf "$tmp_dir"
+      trap - EXIT
+    }
+
+    npm_fallback_install() {
+      install_node_binary
+      npm config set prefix "$HOME/.npm-global"
+      echo "Online installer failed, falling back to npm install..."
+      SHARP_IGNORE_GLOBAL_LIBVIPS=1 npm install -g openclaw@latest --loglevel=notice
+      hash -r
+      openclaw --version
+    }
+
     echo "Downloading agent installer..."
-    curl -fL https://openclaw.ai/install.sh -o /tmp/openclaw-install.sh --connect-timeout 10 --max-time 120
+    curl -fL https://openclaw.ai/install.sh -o /tmp/openclaw-install.sh --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 --max-time 300
     chmod +x /tmp/openclaw-install.sh
-    echo "Running installer..."
-    bash /tmp/openclaw-install.sh --no-onboard
+    echo "Running online installer..."
+    if bash /tmp/openclaw-install.sh --no-onboard --verbose; then
+      echo "Online installer completed successfully"
+    else
+      npm_fallback_install
+    fi
     rm -f /tmp/openclaw-install.sh
     echo "Install finished"
   start_cmd: "openclaw gateway --port ${AGENTBOX_PORT:-18789} --bind loopback --allow-unconfigured"
@@ -26,8 +94,8 @@ volumes:
 
 resources:
   cpus: 2
-  memory_mb: 2048
-  disk_gb: 5
+  memory_mb: 4096
+  disk_gb: 10
 
 health:
   url: http://localhost:18789/
@@ -58,4 +126,4 @@ config_schema:
     default: "anthropic/claude-sonnet-4-20250514"
   - key: base_url
     type: string
-    label: "自定义 API 地址（仅 openrouter/自建服务需要）"
+    label: "自定义 API 地址（可选，走代理或自建服务时填写）"

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use tauri::State;
@@ -74,6 +75,10 @@ fn shell_escape(value: &str) -> String {
     value.replace('\'', "'\\''")
 }
 
+fn bash_lc(command: &str) -> String {
+    format!("bash -lc '{}'", shell_escape(command))
+}
+
 fn native_log_dir() -> &'static str {
     "$HOME/agentbox-logs"
 }
@@ -88,6 +93,62 @@ fn native_pid_dir() -> &'static str {
 
 fn native_pid_path(container_name: &str) -> String {
     format!("{}/{container_name}.pid", native_pid_dir())
+}
+
+fn native_net_rx_comment(port: u16) -> String {
+    format!("agentbox-net-rx-{port}")
+}
+
+fn native_net_tx_comment(port: u16) -> String {
+    format!("agentbox-net-tx-{port}")
+}
+
+async fn ensure_native_network_counters(
+    state: &AppState,
+    agent: &AgentInfo,
+) {
+    let vm = vm_for_agent(state, agent);
+    let rx_comment = native_net_rx_comment(agent.port);
+    let tx_comment = native_net_tx_comment(agent.port);
+    let cmd = format!(
+        "if command -v iptables >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then \
+           sudo -n iptables -C INPUT -p tcp --dport {port} -m comment --comment '{rx_comment}' -j ACCEPT 2>/dev/null || \
+             sudo -n iptables -I INPUT 1 -p tcp --dport {port} -m comment --comment '{rx_comment}' -j ACCEPT; \
+           sudo -n iptables -C OUTPUT -p tcp --sport {port} -m comment --comment '{tx_comment}' -j ACCEPT 2>/dev/null || \
+             sudo -n iptables -I OUTPUT 1 -p tcp --sport {port} -m comment --comment '{tx_comment}' -j ACCEPT; \
+         fi"
+                ,
+                port = agent.port,
+    );
+
+    if let Err(error) = vm.shell_run(&cmd).await {
+        tracing::warn!(agent = %agent.name, port = agent.port, error = %error, "Failed to install native network counter rules");
+    }
+}
+
+async fn cleanup_native_network_counters(
+    state: &AppState,
+    agent: &AgentInfo,
+) {
+    let vm = vm_for_agent(state, agent);
+    let rx_comment = native_net_rx_comment(agent.port);
+    let tx_comment = native_net_tx_comment(agent.port);
+    let cmd = format!(
+        "if command -v iptables >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then \
+           while sudo -n iptables -C INPUT -p tcp --dport {port} -m comment --comment '{rx_comment}' -j ACCEPT 2>/dev/null; do \
+             sudo -n iptables -D INPUT -p tcp --dport {port} -m comment --comment '{rx_comment}' -j ACCEPT || break; \
+           done; \
+           while sudo -n iptables -C OUTPUT -p tcp --sport {port} -m comment --comment '{tx_comment}' -j ACCEPT 2>/dev/null; do \
+             sudo -n iptables -D OUTPUT -p tcp --sport {port} -m comment --comment '{tx_comment}' -j ACCEPT || break; \
+           done; \
+         fi"
+                ,
+                port = agent.port,
+    );
+
+    if let Err(error) = vm.shell_run(&cmd).await {
+        tracing::warn!(agent = %agent.name, port = agent.port, error = %error, "Failed to cleanup native network counter rules");
+    }
 }
 
 fn openclaw_home_dir(container_name: &str) -> String {
@@ -107,6 +168,262 @@ fn openclaw_shell_exports(container_name: &str) -> String {
     format!("export OPENCLAW_HOME=\"{}\";", openclaw_home_dir(container_name))
 }
 
+fn native_runtime_path() -> &'static str {
+    "$HOME/.openclaw/bin:$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSettings {
+    pub instance_autostart_enabled: bool,
+    pub instance_autostart_delay_secs: i64,
+    pub proxy_enabled: bool,
+    pub proxy_url: Option<String>,
+    pub no_proxy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogCleanupResult {
+    pub removed_native_logs: u64,
+    pub removed_pid_files: u64,
+    pub removed_metrics_rows: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyPreview {
+    pub current_platform: String,
+    pub original: Option<String>,
+    pub lima_preview: Option<String>,
+    pub wsl_preview: Option<String>,
+    pub qemu_preview: Option<String>,
+}
+
+async fn load_app_settings(state: &AppState) -> Result<AppSettings, String> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO app_settings (id, instance_autostart_enabled, instance_autostart_delay_secs, proxy_enabled, proxy_url, no_proxy, updated_at) \
+         VALUES (1, 1, 8, 0, NULL, NULL, datetime('now'))"
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let row = sqlx::query_as::<_, (bool, i64, bool, Option<String>, Option<String>)>(
+        "SELECT instance_autostart_enabled, instance_autostart_delay_secs, proxy_enabled, proxy_url, no_proxy \
+         FROM app_settings WHERE id = 1"
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(AppSettings {
+        instance_autostart_enabled: row.0,
+        instance_autostart_delay_secs: row.1.max(0),
+        proxy_enabled: row.2,
+        proxy_url: row.3.filter(|value| !value.trim().is_empty()),
+        no_proxy: row.4.filter(|value| !value.trim().is_empty()),
+    })
+}
+
+fn set_env_var(key: &str, value: &str) {
+    unsafe {
+        std::env::set_var(key, value);
+    }
+}
+
+fn remove_env_var(key: &str) {
+    unsafe {
+        std::env::remove_var(key);
+    }
+}
+
+fn is_socks_proxy_url(proxy_url: &str) -> bool {
+    Url::parse(proxy_url)
+        .map(|parsed| parsed.scheme().to_ascii_lowercase().starts_with("socks"))
+        .unwrap_or_else(|_| proxy_url.to_ascii_lowercase().starts_with("socks"))
+}
+
+fn apply_proxy_env(settings: &AppSettings) {
+    if settings.proxy_enabled {
+        if let Some(proxy_url) = settings.proxy_url.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            set_env_var("ALL_PROXY", proxy_url);
+            set_env_var("all_proxy", proxy_url);
+
+            if is_socks_proxy_url(proxy_url) {
+                remove_env_var("HTTP_PROXY");
+                remove_env_var("HTTPS_PROXY");
+                remove_env_var("http_proxy");
+                remove_env_var("https_proxy");
+            } else {
+                set_env_var("HTTP_PROXY", proxy_url);
+                set_env_var("HTTPS_PROXY", proxy_url);
+                set_env_var("http_proxy", proxy_url);
+                set_env_var("https_proxy", proxy_url);
+            }
+        }
+
+        if let Some(no_proxy) = settings.no_proxy.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            set_env_var("NO_PROXY", no_proxy);
+            set_env_var("no_proxy", no_proxy);
+        } else {
+            remove_env_var("NO_PROXY");
+            remove_env_var("no_proxy");
+        }
+    } else {
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"] {
+            remove_env_var(key);
+        }
+    }
+}
+
+pub async fn apply_saved_proxy_env(state: &AppState) -> Result<(), String> {
+    let settings = load_app_settings(state).await?;
+    apply_proxy_env(&settings);
+    Ok(())
+}
+
+fn vm_proxy_source_snippet() -> &'static str {
+    "test -f \"$HOME/.agentbox/proxy.env\" && . \"$HOME/.agentbox/proxy.env\"; "
+}
+
+async fn vm_host_alias_for_loopback_proxy(vm: &agentbox_vm::VmManager) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = vm;
+        Some("host.lima.internal".to_string())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if vm.name().starts_with("wsl-") {
+            let detected = vm
+                .shell_run("awk '/^nameserver / { print $2; exit }' /etc/resolv.conf 2>/dev/null || true")
+                .await
+                .ok()
+                .map(|output| output.trim().to_string())
+                .filter(|value| !value.is_empty());
+
+            if let Some(host) = detected {
+                return Some(host);
+            }
+
+            return Some("host.docker.internal".to_string());
+        }
+
+        if vm.name().starts_with("qemu-") {
+            return Some("10.0.2.2".to_string());
+        }
+
+        None
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = vm;
+        None
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn detect_wsl_host_alias_for_preview() -> Option<String> {
+    let output = tokio::process::Command::new("wsl.exe")
+        .args(["--", "sh", "-c", "awk '/^nameserver / { print $2; exit }' /etc/resolv.conf 2>/dev/null || true"])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return Some("host.docker.internal".to_string());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        Some("host.docker.internal".to_string())
+    } else {
+        Some(stdout)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn detect_wsl_host_alias_for_preview() -> Option<String> {
+    None
+}
+
+fn rewrite_proxy_url_with_host_alias(proxy_url: &str, host_alias: &str) -> String {
+    let Ok(mut parsed) = Url::parse(proxy_url) else {
+        return proxy_url.to_string();
+    };
+
+    let Some(host) = parsed.host_str() else {
+        return proxy_url.to_string();
+    };
+
+    if !matches!(host, "127.0.0.1" | "localhost" | "::1") {
+        return proxy_url.to_string();
+    }
+
+    if parsed.set_host(Some(host_alias)).is_ok() {
+        parsed.to_string()
+    } else {
+        proxy_url.to_string()
+    }
+}
+
+async fn rewrite_proxy_url_for_vm(vm: &agentbox_vm::VmManager, proxy_url: &str) -> String {
+    let Some(host_alias) = vm_host_alias_for_loopback_proxy(vm).await else {
+        return proxy_url.to_string();
+    };
+    let rewritten = rewrite_proxy_url_with_host_alias(proxy_url, &host_alias);
+    if rewritten != proxy_url {
+        tracing::info!(from = %proxy_url, to = %rewritten, "Rewrote loopback proxy URL for VM guest access");
+    }
+    rewritten
+}
+
+async fn sync_vm_proxy_settings(
+    state: &AppState,
+    vm: &agentbox_vm::VmManager,
+) -> Result<(), String> {
+    let settings = load_app_settings(state).await?;
+    let mut env_lines = vec![
+        "# Managed by AgentBox".to_string(),
+        "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy".to_string(),
+    ];
+
+    if settings.proxy_enabled {
+        if let Some(proxy_url) = settings.proxy_url.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            let vm_proxy_url = rewrite_proxy_url_for_vm(vm, proxy_url).await;
+            let escaped = shell_escape(&vm_proxy_url);
+            env_lines.push(format!("export ALL_PROXY='{}'", escaped));
+            env_lines.push(format!("export all_proxy='{}'", escaped));
+
+            if is_socks_proxy_url(&vm_proxy_url) {
+                env_lines.push("unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy".to_string());
+            } else {
+                env_lines.push(format!("export HTTP_PROXY='{}'", escaped));
+                env_lines.push(format!("export HTTPS_PROXY='{}'", escaped));
+                env_lines.push(format!("export http_proxy='{}'", escaped));
+                env_lines.push(format!("export https_proxy='{}'", escaped));
+            }
+        }
+
+        if let Some(no_proxy) = settings.no_proxy.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            let escaped = shell_escape(no_proxy);
+            env_lines.push(format!("export NO_PROXY='{}'", escaped));
+            env_lines.push(format!("export no_proxy='{}'", escaped));
+        }
+    } else {
+        env_lines.push("# Proxy disabled".to_string());
+    }
+
+    let env_content = env_lines.join("\n");
+    let source_line = "test -f \"$HOME/.agentbox/proxy.env\" && . \"$HOME/.agentbox/proxy.env\"";
+    let sync_cmd = format!(
+        "mkdir -p \"$HOME/.agentbox\" && cat > \"$HOME/.agentbox/proxy.env\" <<'__AGENTBOX_PROXY_EOF__'\n{env_content}\n__AGENTBOX_PROXY_EOF__\nchmod 600 \"$HOME/.agentbox/proxy.env\"\nfor rc in \"$HOME/.bashrc\" \"$HOME/.profile\"; do touch \"$rc\"; grep -qxF '{source_line}' \"$rc\" || printf '%s\\n' '{source_line}' >> \"$rc\"; done"
+    );
+
+    vm.shell_run(&sync_cmd).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 async fn resolve_openclaw_gateway_token(
     state: &AppState,
     agent: &AgentInfo,
@@ -117,7 +434,9 @@ async fn resolve_openclaw_gateway_token(
     // Prefer the effective config seen inside the instance over the DB cache.
     let config_token = vm
         .shell_run(&format!(
-            "export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports} openclaw config get gateway.auth.token 2>/dev/null || true"
+            "export PATH=\"{}\"; {}{openclaw_exports} openclaw config get gateway.auth.token 2>/dev/null || true",
+            native_runtime_path(),
+            vm_proxy_source_snippet(),
         ))
         .await
         .ok()
@@ -181,13 +500,17 @@ async fn verify_vm_internet_connectivity(
     max_attempts: u32,
     interval_secs: u64,
 ) -> Result<(), anyhow::Error> {
-    let check_cmd = "curl --connect-timeout 8 --max-time 15 -fsS -o /dev/null https://openclaw.ai/ && echo OK || echo FAIL";
+    sync_vm_proxy_settings(state, vm).await.map_err(anyhow::Error::msg)?;
+    let check_cmd = format!(
+        "{}curl --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 60 -fsS -o /dev/null https://openclaw.ai/ && echo OK || echo FAIL",
+        vm_proxy_source_snippet(),
+    );
 
     for attempt in 1..=max_attempts {
         ensure_provisioning_active(state, vm, agent_id).await?;
         tracing::info!(attempt, max_attempts, "Verifying VM internet connectivity...");
 
-        let net_ok = vm.shell_run(check_cmd).await.unwrap_or_default();
+        let net_ok = vm.shell_run(&check_cmd).await.unwrap_or_default();
         if net_ok.trim() == "OK" {
             tracing::info!(attempt, max_attempts, "VM internet connectivity OK");
             return Ok(());
@@ -283,6 +606,8 @@ async fn stop_native_agent_process(
             .shell_run(&format!("pkill -f '{}' 2>/dev/null || true", shell_escape(proc_name)))
             .await;
     }
+
+    cleanup_native_network_counters(state, agent).await;
 }
 
 async fn upsert_openclaw_auth_profile(
@@ -334,7 +659,8 @@ async fn upsert_openclaw_auth_profile(
     vm.shell_run(&write_cmd).await.map_err(|e| e.to_string())?;
 
     let order_cmd = format!(
-        "export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {shell_prefix} openclaw models auth order set --provider '{provider_id}' --agent main '{profile_id}' 2>/dev/null || true"
+        "export PATH=\"{}\"; {shell_prefix} openclaw models auth order set --provider '{provider_id}' --agent main '{profile_id}' 2>/dev/null || true",
+        native_runtime_path(),
     );
     let _ = vm.shell_run(&order_cmd).await;
 
@@ -488,6 +814,34 @@ pub struct SystemInfo {
     pub free_disk_gb: u64,
     pub max_instances: u32,
     pub max_running: u32,
+    /// Windows 11 (build >= 22000) supports WSLg (Linux GUI apps natively).
+    /// false on macOS/Linux and Windows 10 or earlier.
+    pub wsl_gui_supported: bool,
+}
+
+/// Returns true when the OS is Windows 11 or later (NT build >= 22000),
+/// which ships WSLg — native Linux GUI app support in WSL2.
+#[cfg(target_os = "windows")]
+fn detect_wsl_gui_supported() -> bool {
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command",
+               "[System.Environment]::OSVersion.Version.Build"])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse::<u32>()
+                .map(|build| build >= 22000)
+                .unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn detect_wsl_gui_supported() -> bool {
+    false
 }
 
 /// Per-agent config entry.
@@ -572,6 +926,7 @@ pub async fn get_system_info() -> Result<SystemInfo, String> {
         free_disk_gb: res.free_disk_gb,
         max_instances,
         max_running,
+        wsl_gui_supported: detect_wsl_gui_supported(),
     })
 }
 
@@ -597,6 +952,159 @@ pub async fn get_agent_metrics(
     .map_err(|e: sqlx::Error| e.to_string())?;
 
     Ok(rows)
+}
+
+#[tauri::command]
+pub async fn get_app_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    load_app_settings(&state).await
+}
+
+#[tauri::command]
+pub async fn save_app_settings(
+    settings: AppSettings,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let delay_secs = settings.instance_autostart_delay_secs.max(0);
+    let proxy_url = settings
+        .proxy_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let no_proxy = settings
+        .no_proxy
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    sqlx::query(
+        "INSERT INTO app_settings (id, instance_autostart_enabled, instance_autostart_delay_secs, proxy_enabled, proxy_url, no_proxy, updated_at) \
+         VALUES (1, ?, ?, ?, ?, ?, datetime('now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+            instance_autostart_enabled = excluded.instance_autostart_enabled, \
+            instance_autostart_delay_secs = excluded.instance_autostart_delay_secs, \
+            proxy_enabled = excluded.proxy_enabled, \
+            proxy_url = excluded.proxy_url, \
+            no_proxy = excluded.no_proxy, \
+            updated_at = datetime('now')"
+    )
+    .bind(settings.instance_autostart_enabled)
+    .bind(delay_secs)
+    .bind(settings.proxy_enabled)
+    .bind(proxy_url.clone())
+    .bind(no_proxy.clone())
+    .execute(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    apply_proxy_env(&AppSettings {
+        instance_autostart_enabled: settings.instance_autostart_enabled,
+        instance_autostart_delay_secs: delay_secs,
+        proxy_enabled: settings.proxy_enabled,
+        proxy_url,
+        no_proxy,
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn clear_local_logs(state: State<'_, AppState>) -> Result<LogCleanupResult, String> {
+    let mut removed_native_logs = 0u64;
+    let mut removed_pid_files = 0u64;
+
+    if let Some(home) = dirs_next::home_dir() {
+        let native_logs_dir = home.join("agentbox-logs");
+        if native_logs_dir.exists() {
+            for entry in std::fs::read_dir(&native_logs_dir).map_err(|e| e.to_string())? {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                if path.is_file() {
+                    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+                    removed_native_logs += 1;
+                }
+            }
+        }
+
+        let pid_dir = home.join(".agentbox").join("pids");
+        if pid_dir.exists() {
+            for entry in std::fs::read_dir(&pid_dir).map_err(|e| e.to_string())? {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                if path.is_file() {
+                    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+                    removed_pid_files += 1;
+                }
+            }
+        }
+    }
+
+    let removed_metrics_rows = sqlx::query("DELETE FROM agent_metrics")
+        .execute(&state.db)
+        .await
+        .map_err(|e| e.to_string())?
+        .rows_affected();
+
+    Ok(LogCleanupResult {
+        removed_native_logs,
+        removed_pid_files,
+        removed_metrics_rows,
+    })
+}
+
+#[tauri::command]
+pub async fn get_proxy_preview(proxy_url: Option<String>) -> Result<ProxyPreview, String> {
+    let original = proxy_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    let current_platform = if cfg!(target_os = "macos") {
+        "macos".to_string()
+    } else if cfg!(target_os = "windows") {
+        "windows".to_string()
+    } else {
+        "linux".to_string()
+    };
+
+    let Some(original_url) = original.clone() else {
+        return Ok(ProxyPreview {
+            current_platform,
+            original: None,
+            lima_preview: None,
+            wsl_preview: None,
+            qemu_preview: None,
+        });
+    };
+
+    let lima_preview = if cfg!(target_os = "macos") {
+        Some(rewrite_proxy_url_with_host_alias(&original_url, "host.lima.internal"))
+    } else {
+        None
+    };
+
+    let wsl_preview = if cfg!(target_os = "windows") {
+        let host = detect_wsl_host_alias_for_preview()
+            .await
+            .unwrap_or_else(|| "host.docker.internal".to_string());
+        Some(rewrite_proxy_url_with_host_alias(&original_url, &host))
+    } else {
+        None
+    };
+
+    let qemu_preview = if cfg!(target_os = "windows") {
+        Some(rewrite_proxy_url_with_host_alias(&original_url, "10.0.2.2"))
+    } else {
+        None
+    };
+
+    Ok(ProxyPreview {
+        current_platform,
+        original,
+        lima_preview,
+        wsl_preview,
+        qemu_preview,
+    })
 }
 
 /// Get latest health reports from the background checker.
@@ -1036,9 +1544,11 @@ async fn provision_agent(
             // Network pre-flight: verify VM can reach the internet before running install_cmd.
             // DNS and outbound networking may need a short warm-up right after first boot.
             verify_vm_internet_connectivity(state, vm, agent_id, 5, 5).await?;
+            sync_vm_proxy_settings(state, vm).await.map_err(anyhow::Error::msg)?;
+            let install_cmd = bash_lc(&format!("{}{}", vm_proxy_source_snippet(), install_cmd));
 
             tracing::info!(cmd = %install_cmd, "Installing native agent in VM");
-            match vm.shell_run(install_cmd).await {
+            match vm.shell_run(&install_cmd).await {
                 Ok(_) => {
                     tracing::info!("Native agent install completed successfully");
                     ensure_provisioning_active(state, vm, agent_id).await?;
@@ -1090,13 +1600,34 @@ async fn provision_agent(
             }
             ensure_provisioning_active(state, vm, agent_id).await?;
 
+            let agent_info_for_counters = AgentInfo {
+                id: agent_id.to_string(),
+                name: container_name.to_string(),
+                template: tmpl.name.to_lowercase(),
+                instance_no: 0,
+                port: host_port,
+                status: STATUS_CREATING.to_string(),
+                auto_start: false,
+                health_url: None,
+                created_at: String::new(),
+                version: tmpl.version.clone(),
+                install_method: tmpl.install_method.clone(),
+                container_name: container_name.to_string(),
+                vm_name: vm.name().to_string(),
+                runtime_mode: None,
+                ubuntu_image: None,
+            };
+            ensure_native_network_counters(state, &agent_info_for_counters).await;
+
             let run_cmd = if extra_env.is_empty() {
                 format!(
-                    "bash -c 'export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports}export AGENTBOX_PORT={host_port}; nohup {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'"
+                    "bash -c 'export PATH=\"$HOME/.openclaw/bin:$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {}{openclaw_exports}export AGENTBOX_PORT={host_port}; nohup {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'",
+                    vm_proxy_source_snippet(),
                 )
             } else {
                 format!(
-                    "bash -c 'export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports}export AGENTBOX_PORT={host_port}; export {extra_env}; nohup {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'"
+                    "bash -c 'export PATH=\"$HOME/.openclaw/bin:$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {}{openclaw_exports}export AGENTBOX_PORT={host_port}; export {extra_env}; nohup {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'",
+                    vm_proxy_source_snippet(),
                 )
             };
             tracing::info!(cmd = %run_cmd, "Starting native agent");
@@ -1231,6 +1762,7 @@ pub async fn start_agent(id: String, state: State<'_, AppState>) -> Result<(), S
     let start_result: Result<(), String> = async {
         let vm = vm_for_agent(&state, &agent);
         vm.ensure_ready(None).await.map_err(|e| e.to_string())?;
+        sync_vm_proxy_settings(&state, &vm).await?;
 
         match agent.install_method.as_str() {
         "compose" => {
@@ -1258,6 +1790,7 @@ pub async fn start_agent(id: String, state: State<'_, AppState>) -> Result<(), S
             let pid_path = native_pid_path(&agent.container_name);
             let _ = vm.shell_run(&format!("mkdir -p {} {}", native_log_dir(), native_pid_dir())).await;
             vm.shell_run(&format!(": > {log_path}")).await.map_err(|e| e.to_string())?;
+            ensure_native_network_counters(&state, &agent).await;
 
             // For openclaw: inject gateway token env var
             let mut extra_env = String::new();
@@ -1284,7 +1817,9 @@ pub async fn start_agent(id: String, state: State<'_, AppState>) -> Result<(), S
             }
 
             let run_cmd = format!(
-                "bash -c 'export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports}export AGENTBOX_PORT={}; {extra_env}nohup {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'",
+                "bash -c 'export PATH=\"{}\"; {}{openclaw_exports}export AGENTBOX_PORT={}; {extra_env}nohup {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'",
+                native_runtime_path(),
+                vm_proxy_source_snippet(),
                 agent.port
             );
             vm.shell_run(&run_cmd).await.map_err(|e| e.to_string())?;
@@ -1575,7 +2110,7 @@ pub async fn apply_agent_config(
         } else {
             normalized_model.clone()
         };
-        let is_custom_provider = matches!(provider, "deepseek" | "qwen" | "ollama");
+        let is_custom_provider = matches!(provider, "deepseek" | "qwen");
 
         // Map provider to correct env var name
         let env_var_name = match provider {
@@ -1598,30 +2133,44 @@ pub async fn apply_agent_config(
             "openrouter" => "openrouter-api-key",
             "mistral" => "mistral-api-key",
             "moonshot" => "moonshot-api-key",
-            "deepseek" | "qwen" | "ollama" => "custom-api-key",
+            "ollama" => "ollama",
+            "deepseek" | "qwen" => "custom-api-key",
             _ => "apiKey", // anthropic + fallback
         };
 
-        if tmpl.install_method == "native" && !api_key.is_empty() {
+        if tmpl.install_method == "native" && (!api_key.is_empty() || provider == "ollama") {
             let provider_id = openclaw_provider_id(provider);
             let openclaw_state = openclaw_state_dir(&agent.container_name);
             let openclaw_home = openclaw_home_dir(&agent.container_name);
             let openclaw_exports = openclaw_shell_exports(&agent.container_name);
+            sync_vm_proxy_settings(&state, &vm).await.map_err(|e| e.to_string())?;
             vm.shell_run(&format!(
                 "mkdir -p {} {}",
                 openclaw_home,
                 openclaw_state,
             )).await.map_err(|e| e.to_string())?;
 
-            upsert_openclaw_auth_profile(&state, &agent, provider_id, &api_key).await?;
+            if !api_key.is_empty() {
+                upsert_openclaw_auth_profile(&state, &agent, provider_id, &api_key).await?;
+            }
 
-            // Write instance-specific OpenClaw .env with the API key + gateway token
-            let mut dotenv_content = format!("{}={}", env_var_name, api_key);
+            // Write instance-specific OpenClaw .env with provider API key (if any) + gateway token
+            let mut dotenv_lines: Vec<String> = Vec::new();
             let mut gateway_token_export = String::new();
             let mut custom_api_key_export = String::new();
+            let mut provider_api_key_export = String::new();
+
+            if !api_key.is_empty() {
+                dotenv_lines.push(format!("{}={}", env_var_name, api_key));
+                provider_api_key_export = format!(
+                    " export {env_var_name}='{api_key_escaped}';",
+                    env_var_name = env_var_name,
+                    api_key_escaped = api_key.replace('\'', "'\\''")
+                );
+            }
 
             if is_custom_provider {
-                dotenv_content.push_str(&format!("\nCUSTOM_API_KEY={}", api_key));
+                dotenv_lines.push(format!("CUSTOM_API_KEY={}", api_key));
                 custom_api_key_export = format!(
                     " export CUSTOM_API_KEY='{}';",
                     api_key.replace('\'', "'\\''")
@@ -1637,13 +2186,15 @@ pub async fn apply_agent_config(
             .await
             .unwrap_or(None);
             if let Some(ref token) = gw_token {
-                dotenv_content.push_str(&format!("\nOPENCLAW_GATEWAY_TOKEN={}", token));
+                dotenv_lines.push(format!("OPENCLAW_GATEWAY_TOKEN={}", token));
                 env_map.insert("OPENCLAW_GATEWAY_TOKEN".to_string(), token.clone());
                 gateway_token_export = format!(
                     " export OPENCLAW_GATEWAY_TOKEN='{}';",
                     token.replace('\'', "'\\''")
                 );
             }
+
+            let dotenv_content = dotenv_lines.join("\n");
 
             let write_env_cmd = format!(
                 "mkdir -p {state_dir} && printf '%s\\n' '{}' > {state_dir}/.env",
@@ -1655,17 +2206,19 @@ pub async fn apply_agent_config(
 
             // Run openclaw onboard to generate openclaw.json
             let mut onboard_cmd = format!(
-                "export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; \
+                "export PATH=\"{}\"; \
+                 {}\
                  {openclaw_exports} \
-                 export {env_var_name}='{api_key_escaped}'; \
+                 {provider_api_key_export} \
                  {custom_api_key_export} \
                  {gateway_token_export} \
                  openclaw onboard --non-interactive --mode local \
                  --auth-choice {auth_choice} \
                  --gateway-port {port} --gateway-bind loopback \
                  --skip-skills --secret-input-mode ref --accept-risk",
-                env_var_name = env_var_name,
-                api_key_escaped = api_key.replace('\'', "'\\''"),
+                native_runtime_path(),
+                vm_proxy_source_snippet(),
+                provider_api_key_export = provider_api_key_export,
                 custom_api_key_export = custom_api_key_export,
                 gateway_token_export = gateway_token_export,
                 auth_choice = auth_choice,
@@ -1722,7 +2275,7 @@ pub async fn apply_agent_config(
                         model.split('/').last().unwrap_or(&model).to_string()
                     };
                     onboard_cmd.push_str(&format!(
-                        " --custom-base-url '{}' --custom-model-id '{}' --custom-provider-id 'ollama' --custom-compatibility openai --custom-api-key 'ollama'",
+                        " --custom-base-url '{}' --custom-model-id '{}'",
                         base, m
                     ));
                 }
@@ -1749,7 +2302,9 @@ pub async fn apply_agent_config(
             }
 
             let set_model_cmd = format!(
-                "export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports} openclaw models set '{}' 2>/dev/null || true",
+                "export PATH=\"{}\"; {}{openclaw_exports} openclaw models set '{}' 2>/dev/null || true",
+                native_runtime_path(),
+                vm_proxy_source_snippet(),
                 desired_model.replace('\'', "'\\''")
             );
             if let Ok(output) = vm.shell_run(&set_model_cmd).await {
@@ -1762,6 +2317,7 @@ pub async fn apply_agent_config(
         // For native agents: stop process, restart with env vars
         if let Some(start_cmd) = tmpl.runtime.start_cmd.as_deref() {
             stop_native_agent_process(&state, &agent, Some(start_cmd)).await;
+            sync_vm_proxy_settings(&state, &vm).await.map_err(|e| e.to_string())?;
 
             // Build env prefix
             let env_str: String = env_map.iter()
@@ -1779,7 +2335,9 @@ pub async fn apply_agent_config(
                 String::new()
             };
             let run_cmd = format!(
-                "bash -c 'export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports}export AGENTBOX_PORT={}; nohup env {env_str} {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'",
+                "bash -c 'export PATH=\"{}\"; {}{openclaw_exports}export AGENTBOX_PORT={}; nohup env {env_str} {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'",
+                native_runtime_path(),
+                vm_proxy_source_snippet(),
                 agent.port
             );
             vm.shell_run(&run_cmd).await.map_err(|e| e.to_string())?;
@@ -1905,6 +2463,7 @@ pub async fn open_agent_shell(
     if agent.install_method == "native" {
         // Native agents run inside the VM — open a local terminal connected to VM.
         let vm = vm_for_agent(&state, &agent);
+        sync_vm_proxy_settings(&state, &vm).await?;
         if agent.template == "openclaw" {
             if let Some(ssh_info) = vm.ssh_info().map_err(|e| e.to_string())? {
                 #[cfg(target_os = "macos")]
@@ -1960,6 +2519,7 @@ pub async fn run_agent_shell_command(
 
     let output = if agent.install_method == "native" {
         let vm = vm_for_agent(&state, &agent);
+        sync_vm_proxy_settings(&state, &vm).await?;
         // Ensure common user bins are available for native web shell commands.
         let openclaw_exports = if agent.template == "openclaw" {
             format!("{} ", openclaw_shell_exports(&agent.container_name))
@@ -1967,7 +2527,9 @@ pub async fn run_agent_shell_command(
             String::new()
         };
         let full_cmd = format!(
-            "export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports}{cmd}"
+            "export PATH=\"{}\"; {}{openclaw_exports}{cmd}",
+            native_runtime_path(),
+            vm_proxy_source_snippet(),
         );
         vm.shell_run(&full_cmd).await.map_err(|e| e.to_string())?
     } else {
@@ -1999,12 +2561,15 @@ pub async fn open_agent_browser(
     // current auth token when needed.
     if agent.template == "openclaw" {
         let vm = vm_for_agent(&state, &agent);
+        let _ = sync_vm_proxy_settings(&state, &vm).await;
         let openclaw_exports = openclaw_shell_exports(&agent.container_name);
         let gateway_token = resolve_openclaw_gateway_token(&state, &agent).await;
         let dashboard_output = vm
             .shell_run(
                 &format!(
-                    "export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports} openclaw dashboard --no-open 2>/dev/null | grep -Eo 'https?://[^[:space:]]+' | tail -n 1 || true"
+                    "export PATH=\"{}\"; {}{openclaw_exports} openclaw dashboard --no-open 2>/dev/null | grep -Eo 'https?://[^[:space:]]+' | tail -n 1 || true",
+                    native_runtime_path(),
+                    vm_proxy_source_snippet(),
                 ),
             )
             .await
@@ -2074,14 +2639,26 @@ pub async fn get_ssh_info(
 
 /// Auto-start all agents that have `auto_start = true`.
 pub async fn autostart_agents(state: &AppState) -> Result<(), String> {
+    let settings = load_app_settings(state).await?;
+    if !settings.instance_autostart_enabled {
+        tracing::info!("Instance auto-start disabled by app settings");
+        return Ok(());
+    }
+
+    let delay_secs = settings.instance_autostart_delay_secs.max(0) as u64;
     let agents: Vec<AgentInfo> = sqlx::query_as(
-        "SELECT * FROM agents WHERE auto_start = 1 AND status != 'RUNNING'"
+        "SELECT * FROM agents WHERE auto_start = 1 AND status != 'RUNNING' ORDER BY created_at ASC"
     )
     .fetch_all(&state.db)
     .await
     .map_err(|e| e.to_string())?;
 
-    for agent in agents {
+    for (index, agent) in agents.into_iter().enumerate() {
+        if index > 0 && delay_secs > 0 {
+            tracing::info!(delay_secs, next_agent = %agent.id, "Waiting before next auto-started agent");
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+        }
+
         tracing::info!(id = %agent.id, name = %agent.name, "Auto-starting agent");
         sqlx::query("UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?")
             .bind(STATUS_STARTING)
@@ -2127,6 +2704,7 @@ pub async fn autostart_agents(state: &AppState) -> Result<(), String> {
                 match template::load_template(&agent.template) {
                     Ok(tmpl) => {
                         if let Some(start_cmd) = tmpl.runtime.start_cmd.as_deref() {
+                            let _ = sync_vm_proxy_settings(state, &vm).await;
                             let log_path = native_log_path(&agent.container_name);
                             let pid_path = native_pid_path(&agent.container_name);
                             let _ = vm.shell_run(&format!("mkdir -p {} {}", native_log_dir(), native_pid_dir())).await;
@@ -2157,7 +2735,9 @@ pub async fn autostart_agents(state: &AppState) -> Result<(), String> {
                             }
 
                             let run_cmd = format!(
-                                "bash -c 'export PATH=\"$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH\"; {openclaw_exports}export AGENTBOX_PORT={}; {extra_env}nohup {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'",
+                                "bash -c 'export PATH=\"{}\"; {}{openclaw_exports}export AGENTBOX_PORT={}; {extra_env}nohup {start_cmd} >> {log_path} 2>&1 & pid=$!; printf \"%s\" \"$pid\" > {pid_path}; echo $pid'",
+                                native_runtime_path(),
+                                vm_proxy_source_snippet(),
                                 agent.port
                             );
                             match vm.shell_run(&run_cmd).await {
@@ -2229,6 +2809,105 @@ pub async fn export_agent_data(
     .map_err(|e| e.to_string())?;
 
     export_agent_data_internal(&agent, &state).await
+}
+
+/// Export OpenClaw runtime/app configuration as a JSON file.
+#[tauri::command]
+pub async fn export_openclaw_config(
+    id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    if agent.template != "openclaw" {
+        return Err("仅支持导出 OpenClaw 实例配置".to_string());
+    }
+
+    let export_dir = backups_base_dir()
+        .map_err(|e| e.to_string())?
+        .join("configs");
+    std::fs::create_dir_all(&export_dir).map_err(|e| e.to_string())?;
+
+    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S");
+    let file_name = format!("openclaw-config-{}-{ts}.json", agent.container_name);
+    let file_path = export_dir.join(file_name);
+
+    let configs: Vec<AgentConfigEntry> = sqlx::query_as(
+        "SELECT config_key, config_value, is_secret FROM agent_configs WHERE agent_id = ? ORDER BY config_key"
+    )
+    .bind(&agent.id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let mut payload = serde_json::json!({
+        "agent": {
+            "id": agent.id,
+            "name": agent.name,
+            "template": agent.template,
+            "vm_name": agent.vm_name,
+            "port": agent.port,
+            "created_at": agent.created_at,
+            "version": agent.version,
+            "install_method": agent.install_method,
+        },
+        "configs": configs.iter().map(|c| serde_json::json!({
+            "key": c.config_key,
+            "value": c.config_value,
+            "is_secret": c.is_secret,
+        })).collect::<Vec<_>>(),
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+    });
+
+    if agent.install_method == "native" {
+        let vm = vm_for_agent(&state, &agent);
+        let openclaw_json_path = format!(
+            "{}/agents/main/agent/openclaw.json",
+            openclaw_state_dir(&agent.container_name)
+        );
+        let read_cmd = format!(
+            "if [ -f '{path}' ]; then cat '{path}'; fi",
+            path = shell_escape(&openclaw_json_path),
+        );
+
+        if let Ok(json_content) = vm.shell_run(&read_cmd).await {
+            let trimmed = json_content.trim();
+            if !trimmed.is_empty() {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    payload["openclaw_json"] = parsed;
+                }
+            }
+        }
+    }
+
+    let content = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
+    std::fs::write(&file_path, content).map_err(|e| e.to_string())?;
+
+    Ok(file_path.to_string_lossy().to_string())
+}
+
+/// Save an exported file to a user-selected path.
+#[tauri::command]
+pub async fn save_exported_file(
+    source_path: String,
+    target_path: String,
+) -> Result<String, String> {
+    let source = std::path::Path::new(&source_path);
+    if !source.exists() {
+        return Err("导出源文件不存在".to_string());
+    }
+
+    let target = std::path::Path::new(&target_path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    std::fs::copy(source, target).map_err(|e| e.to_string())?;
+    Ok(target.to_string_lossy().to_string())
 }
 
 /// Import backup data into an existing agent.
@@ -2325,6 +3004,19 @@ async fn restore_backup_into_agent_internal(
     if agent.install_method == "native" && agent.template == "openclaw" {
         let extracted_state_dir = extracted.join(".openclaw");
         if extracted_state_dir.exists() {
+            if !restore_configs {
+                // Copy/upgrade flow must keep the new allocated port instead of
+                // reusing the previous instance's gateway port from openclaw.json.
+                let old_runtime_config = extracted_state_dir
+                    .join("agents")
+                    .join("main")
+                    .join("agent")
+                    .join("openclaw.json");
+                if old_runtime_config.exists() {
+                    let _ = std::fs::remove_file(&old_runtime_config);
+                }
+            }
+
             let temp_archive = temp_dir.join("openclaw-import.tar.gz");
             let output = tokio::process::Command::new("tar")
                 .args([
@@ -2357,17 +3049,16 @@ async fn restore_backup_into_agent_internal(
     Ok(())
 }
 
-/// Upgrade an agent: export data → create new instance → import data → archive old.
+/// Copy an agent by creating a new VM-backed instance from exported data.
 #[tauri::command]
-pub async fn upgrade_agent(
+pub async fn copy_agent_vm(
     id: String,
     state: State<'_, AppState>,
 ) -> Result<AgentInfo, String> {
     check_vm_ready(&state)?;
 
-    // Reject if another agent is already being provisioned
     if state.provisioning_count.load(std::sync::atomic::Ordering::Acquire) > 0 {
-        return Err("已有实例正在创建中，请等待完成后再升级".into());
+        return Err("已有实例正在创建中，请等待完成后再复制".into());
     }
 
     let creating_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agents WHERE status = 'CREATING'")
@@ -2375,27 +3066,20 @@ pub async fn upgrade_agent(
         .await
         .map_err(|e| e.to_string())?;
     if creating_count > 0 {
-        return Err("已有实例正在创建中，请等待完成后再升级".into());
+        return Err("已有实例正在创建中，请等待完成后再复制".into());
     }
 
     let provisioning_guard = ProvisioningCounterGuard::new(state.provisioning_count.clone());
 
     let old_agent: AgentInfo = sqlx::query_as("SELECT * FROM agents WHERE id = ?")
-    .bind(&id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
+        .bind(&id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    // 1. Export current data
     let backup_path = export_agent_data_internal(&old_agent, &state).await?;
-    tracing::info!(agent_id = %id, backup = %backup_path, "Exported agent data for upgrade");
+    tracing::info!(agent_id = %id, backup = %backup_path, "Exported agent data for VM copy");
 
-    // 2. Stop old agent
-    if old_agent.status == STATUS_RUNNING {
-        let _ = stop_agent_internal(&old_agent, &state).await;
-    }
-
-    // 3. Create new agent with same name and template
     let tmpl = template::load_template(&old_agent.template).map_err(|e| e.to_string())?;
 
     let new_id = uuid::Uuid::new_v4().to_string();
@@ -2420,33 +3104,38 @@ pub async fn upgrade_agent(
 
     let ret_version = tmpl.version.clone();
     let ret_install_method = tmpl.install_method.clone();
+    let copied_name = format!("{}-副本", old_agent.name);
 
     sqlx::query(
         "INSERT INTO agents (id, name, template, instance_no, port, status, health_url,
                             version, install_method, container_name, vm_name, auto_start, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, 'CREATING', ?, ?, ?, ?, ?, ?, ?, ?)"
     )
-    .bind(&new_id).bind(&old_agent.name).bind(&old_agent.template)
-    .bind(instance_no).bind(port)
+    .bind(&new_id)
+    .bind(&copied_name)
+    .bind(&old_agent.template)
+    .bind(instance_no)
+    .bind(port)
     .bind(&health_url)
     .bind(&tmpl.version)
     .bind(&tmpl.install_method)
     .bind(&container_name)
-        .bind(&vm_name)
-    .bind(old_agent.auto_start)
-    .bind(&now).bind(&now)
+    .bind(&vm_name)
+    .bind(false)
+    .bind(&now)
+    .bind(&now)
     .execute(&state.db)
     .await
     .map_err(|e| e.to_string())?;
 
-    // 4. Provision new container and import data in background
     let db = state.db.clone();
     let new_agent_id = new_id.clone();
     let c_name = container_name.clone();
-        let vm_name_clone = vm_name.clone();
+    let vm_name_clone = vm_name.clone();
     let old_agent_clone = old_agent.clone();
     let backup_path_clone = backup_path.clone();
     let new_health_url = health_url.clone();
+    let copied_name_for_spawn = copied_name.clone();
     let app_state = state.inner().clone();
     let now_ret = now.clone();
     let ret_version_ret = ret_version.clone();
@@ -2464,7 +3153,7 @@ pub async fn upgrade_agent(
         ).await;
         let result = match result {
             Ok(r) => r,
-            Err(_) => Err(anyhow::anyhow!("升级超时（超过30分钟），请删除后重试")),
+            Err(_) => Err(anyhow::anyhow!("复制超时（超过30分钟），请删除后重试")),
         };
         let cancelled = provisioning_cancelled_or_deleted(&app_state, &new_agent_id).await;
         match result {
@@ -2472,53 +3161,55 @@ pub async fn upgrade_agent(
                 if cancelled {
                     let _ = vm.delete().await;
                 } else {
-                let _ = sqlx::query(
-                    "INSERT INTO agent_configs (agent_id, config_key, config_value, is_secret, updated_at) \
-                     SELECT ?, config_key, config_value, is_secret, datetime('now') FROM agent_configs WHERE agent_id = ?"
-                )
-                .bind(&new_agent_id)
-                .bind(&old_agent_clone.id)
-                .execute(&db)
-                .await;
+                    let _ = sqlx::query(
+                        "INSERT INTO agent_configs (agent_id, config_key, config_value, is_secret, updated_at) \
+                        SELECT ?, config_key, config_value, is_secret, datetime('now') \
+                        FROM agent_configs \
+                        WHERE agent_id = ? AND config_key NOT IN ('port', 'gateway_port')"
+                    )
+                    .bind(&new_agent_id)
+                    .bind(&old_agent_clone.id)
+                    .execute(&db)
+                    .await;
 
-                let new_agent_for_import = AgentInfo {
-                    id: new_agent_id.clone(),
-                    name: old_agent_clone.name.clone(),
-                    template: old_agent_clone.template.clone(),
-                    instance_no,
-                    port,
-                    status: STATUS_CREATING.into(),
-                    auto_start: old_agent_clone.auto_start,
-                    health_url: Some(new_health_url.clone()),
-                    created_at: now.clone(),
-                    version: ret_version.clone(),
-                    install_method: ret_install_method.clone(),
-                    container_name: c_name.clone(),
-                    vm_name: vm_name_clone.clone(),
-                    runtime_mode: old_agent_clone.runtime_mode.clone(),
-                    ubuntu_image: old_agent_clone.ubuntu_image.clone(),
-                };
+                    let new_agent_for_import = AgentInfo {
+                        id: new_agent_id.clone(),
+                        name: copied_name_for_spawn.clone(),
+                        template: old_agent_clone.template.clone(),
+                        instance_no,
+                        port,
+                        status: STATUS_CREATING.into(),
+                        auto_start: false,
+                        health_url: Some(new_health_url.clone()),
+                        created_at: now.clone(),
+                        version: ret_version.clone(),
+                        install_method: ret_install_method.clone(),
+                        container_name: c_name.clone(),
+                        vm_name: vm_name_clone.clone(),
+                        runtime_mode: old_agent_clone.runtime_mode.clone(),
+                        ubuntu_image: old_agent_clone.ubuntu_image.clone(),
+                    };
 
-                if let Err(e) = restore_backup_into_agent_internal(&new_agent_for_import, &backup_path_clone, &app_state, false).await {
-                    tracing::warn!(agent_id = %new_agent_id, error = %e, "Failed to import backup into upgraded agent");
-                }
+                    if let Err(e) = restore_backup_into_agent_internal(&new_agent_for_import, &backup_path_clone, &app_state, false).await {
+                        tracing::warn!(agent_id = %new_agent_id, error = %e, "Failed to import backup into copied agent");
+                    }
 
-                let new_status = if prov.needs_manual_install { STATUS_CREATE_FAILED } else { STATUS_RUNNING };
-                let _ = sqlx::query(
-                    "UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?"
-                )
-                .bind(new_status)
-                .bind(&new_agent_id)
-                .execute(&db)
-                .await;
+                    let new_status = if prov.needs_manual_install { STATUS_CREATE_FAILED } else { STATUS_RUNNING };
+                    let _ = sqlx::query(
+                        "UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?"
+                    )
+                    .bind(new_status)
+                    .bind(&new_agent_id)
+                    .execute(&db)
+                    .await;
                 }
             }
             Err(e) => {
                 if cancelled {
                     let _ = vm.delete().await;
-                    tracing::info!(agent_id = %new_agent_id, "Provisioning cancelled while upgrade create was in progress");
+                    tracing::info!(agent_id = %new_agent_id, "Provisioning cancelled while copy was in progress");
                 } else {
-                    tracing::error!(agent_id = %new_agent_id, error = %e, "Failed to provision upgrade");
+                    tracing::error!(agent_id = %new_agent_id, error = %e, "Failed to provision copied agent");
                     let _ = sqlx::query(
                         "UPDATE agents SET status = ?, updated_at = datetime('now') WHERE id = ?"
                     )
@@ -2534,24 +3225,14 @@ pub async fn upgrade_agent(
         prov_count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     });
 
-    // 5. Mark old agent as archived
-    sqlx::query(
-        "UPDATE agents SET status = ?, name = name || ' (旧)', updated_at = datetime('now') WHERE id = ?"
-    )
-    .bind(STATUS_PENDING)
-    .bind(&id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| e.to_string())?;
-
     Ok(AgentInfo {
         id: new_id,
-        name: old_agent.name,
+        name: copied_name,
         template: old_agent.template,
         instance_no,
         port,
         status: STATUS_CREATING.into(),
-        auto_start: old_agent.auto_start,
+        auto_start: false,
         health_url: Some(health_url),
         created_at: now_ret,
         version: ret_version_ret,
@@ -2713,14 +3394,48 @@ async fn export_native_openclaw_data(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "当前平台暂不支持导出原生 OpenClaw 备份，请先在 macOS/Linux 验证".to_string())?;
 
-    std::fs::create_dir_all(staging_dir).map_err(|e| e.to_string())?;
+    let vm_archive = format!(
+        "/tmp/agentbox-openclaw-export-{}-{}.tar.gz",
+        agent.container_name,
+        chrono::Utc::now().timestamp(),
+    );
+    let package_cmd = format!(
+        "state_dir=\"{}\"; if [ ! -d \"$state_dir\" ]; then echo MISSING; exit 2; fi; tar -czf '{}' -C \"$state_dir\" .",
+        openclaw_state_dir(&agent.container_name),
+        shell_escape(&vm_archive),
+    );
+    vm.shell_run(&package_cmd)
+        .await
+        .map_err(|e| format!("在 VM 内打包 OpenClaw 备份失败: {e}"))?;
+
+    std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+    let local_archive = staging_dir.join("openclaw-export.tar.gz");
     let output = tokio::process::Command::new("scp")
         .args([
             "-F",
             &ssh_info.config_file,
-            "-r",
-            &format!("{}:{}", ssh_info.host, openclaw_state_dir(&agent.container_name)),
-            &staging_dir.to_string_lossy(),
+            &format!("{}:{}", ssh_info.host, vm_archive),
+            &local_archive.to_string_lossy(),
+        ])
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let _ = vm
+        .shell_run(&format!("rm -f '{}'", shell_escape(&vm_archive)))
+        .await;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("从 VM 拉取 OpenClaw 备份失败: {stderr}"));
+    }
+
+    let output = tokio::process::Command::new("tar")
+        .args([
+            "-xzf",
+            &local_archive.to_string_lossy(),
+            "-C",
+            &target_dir.to_string_lossy(),
         ])
         .output()
         .await
@@ -2728,8 +3443,10 @@ async fn export_native_openclaw_data(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("从 VM 拉取 OpenClaw 备份失败: {stderr}"));
+        return Err(format!("解压 OpenClaw 备份失败: {stderr}"));
     }
+
+    let _ = std::fs::remove_file(&local_archive);
 
     Ok(())
 }
@@ -2909,7 +3626,24 @@ fn shell_default_for_agent(_agent: &AgentInfo) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 
 /// Build the command args for spawning a PTY session for an agent.
-fn pty_command_for_agent(agent: &AgentInfo, state: &AppState) -> Vec<String> {
+fn initial_shell_input(openclaw_home: Option<&str>) -> String {
+    let mut commands = vec![
+        "stty sane 2>/dev/null || true".to_string(),
+        "export TERM=xterm-256color".to_string(),
+    ];
+
+    if let Some(home) = openclaw_home {
+        commands.push(format!(
+            "export OPENCLAW_HOME='{}'",
+            home.replace('\'', "'\\''")
+        ));
+    }
+
+    commands.push("printf '\\r\\n'".to_string());
+    format!("{}\r", commands.join("\r"))
+}
+
+fn pty_command_for_agent(agent: &AgentInfo, state: &AppState) -> (Vec<String>, Option<String>) {
     if agent.install_method == "native" {
         let openclaw_home = openclaw_home_dir(&agent.container_name);
         let vm = vm_for_agent(state, agent);
@@ -2918,31 +3652,49 @@ fn pty_command_for_agent(agent: &AgentInfo, state: &AppState) -> Vec<String> {
         if prefix.is_empty() {
             // Linux: direct local shell
             if agent.template == "openclaw" {
-                vec![
-                    "env".into(),
-                    format!("OPENCLAW_HOME={openclaw_home}"),
-                    "/bin/bash".into(),
-                ]
+                (
+                    vec![
+                        "env".into(),
+                        format!("OPENCLAW_HOME={openclaw_home}"),
+                        "/bin/bash".into(),
+                    ],
+                    None,
+                )
             } else {
-                vec!["/bin/bash".into()]
+                (vec!["/bin/bash".into()], None)
             }
         } else {
-            // macOS (Lima): limactl shell agentbox
-            // prefix is ["limactl", "shell", "agentbox", "--", "sudo"]
-            // We want interactive login shell without sudo: ["limactl", "shell", "agentbox"]
-            let limactl = &prefix[0];
-            if agent.template == "openclaw" {
-                vec![
-                    limactl.clone(),
-                    "shell".into(),
-                    agent.vm_name.clone(),
-                    "--".into(),
-                    "env".into(),
-                    format!("OPENCLAW_HOME={openclaw_home}"),
-                    "/bin/bash".into(),
-                ]
+            // macOS (Lima) / WSL: start a plain interactive SSH session and, for OpenClaw,
+            // inject OPENCLAW_HOME as an initial PTY command after the shell is ready.
+            // Running bash as an SSH remote command can leave the session in a partially
+            // interactive state where output appears but typed input is not echoed correctly.
+            if let Ok(Some(ssh_info)) = vm.ssh_info() {
+                let cmd = vec![
+                    "ssh".into(),
+                    "-tt".into(),
+                    "-F".into(),
+                    ssh_info.config_file,
+                    ssh_info.host,
+                ];
+                if agent.template == "openclaw" {
+                    (
+                        cmd,
+                        Some(initial_shell_input(Some(&openclaw_home))),
+                    )
+                } else {
+                    (cmd, Some(initial_shell_input(None)))
+                }
             } else {
-                vec![limactl.clone(), "shell".into(), agent.vm_name.clone()]
+                // Fallback: limactl shell in interactive mode (no command after --)
+                let limactl = &prefix[0];
+                (
+                    vec![limactl.clone(), "shell".into(), agent.vm_name.clone()],
+                    if agent.template == "openclaw" {
+                        Some(initial_shell_input(Some(&openclaw_home)))
+                    } else {
+                        Some(initial_shell_input(None))
+                    },
+                )
             }
         }
     } else {
@@ -2969,7 +3721,7 @@ fn pty_command_for_agent(agent: &AgentInfo, state: &AppState) -> Vec<String> {
             agent.container_name.clone(),
             "/bin/sh".into(),
         ]);
-        cmd
+        (cmd, None)
     }
 }
 
@@ -2992,10 +3744,10 @@ pub async fn pty_spawn(
     .await
     .map_err(|e| e.to_string())?;
 
-    let command = pty_command_for_agent(&agent, &state);
+    let (command, initial_input) = pty_command_for_agent(&agent, &state);
     tracing::info!(session_id = %session_id, agent_id = %agent_id, ?command, "Spawning PTY session");
 
-    pty.spawn(session_id, agent_id, command, rows, cols, app).await
+    pty.spawn(session_id, agent_id, command, initial_input, rows, cols, app).await
 }
 
 /// Write input data to a PTY session.
