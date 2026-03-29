@@ -2,3 +2,5 @@
 !.gitignore
 !FAQ.md
 !GUIDE.md
+!tests
+!tests/*
