@@ -5,6 +5,8 @@
 //! and installs Docker inside.
 
 use anyhow::{Context, Result};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{info, warn};
@@ -147,6 +149,7 @@ impl WslProvider {
         let mut last_err = String::new();
         for url in candidates {
             info!("下载 Ubuntu WSL rootfs: {}", url);
+            let _ = std::fs::remove_file(dest_path);
             let script = format!(
                 "Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing",
                 url, dest_path
@@ -158,8 +161,18 @@ impl WslProvider {
                 .context("powershell 执行失败")?;
 
             if output.status.success() {
-                info!("rootfs 下载成功: {}", url);
-                return Ok(());
+                match Self::validate_rootfs_archive(dest_path) {
+                    Ok(_) => {
+                        info!("rootfs 下载并校验成功: {}", url);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        warn!("rootfs 文件校验失败 ({}): {}", url, e);
+                        let _ = std::fs::remove_file(dest_path);
+                        last_err = format!("URL: {url}\n下载成功但文件校验失败: {e}");
+                        continue;
+                    }
+                }
             }
 
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -170,6 +183,56 @@ impl WslProvider {
         anyhow::bail!(
             "所有候选 URL 均下载失败，请检查网络连接。\n最后一次错误：\n{last_err}"
         )
+    }
+
+    /// 校验 rootfs 归档文件有效性，避免将 HTML 错误页或损坏文件传给 wsl --import。
+    fn validate_rootfs_archive(path: &str) -> Result<()> {
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("无法读取 rootfs 文件元信息: {path}"))?;
+
+        // Ubuntu WSL rootfs 通常远大于 10MB；过小几乎总是错误页或下载中断。
+        const MIN_ROOTFS_SIZE: u64 = 10 * 1024 * 1024;
+        if meta.len() < MIN_ROOTFS_SIZE {
+            anyhow::bail!(
+                "rootfs 文件过小（{} bytes），疑似下载不完整或错误响应",
+                meta.len()
+            );
+        }
+
+        let mut file = File::open(path).with_context(|| format!("无法打开 rootfs 文件: {path}"))?;
+
+        let mut header = [0u8; 512];
+        let read = file
+            .read(&mut header)
+            .with_context(|| format!("无法读取 rootfs 文件头: {path}"))?;
+        if read < 2 {
+            anyhow::bail!("rootfs 文件头过短");
+        }
+
+        let is_gzip = header[0] == 0x1F && header[1] == 0x8B;
+
+        let mut text_probe = vec![0u8; 2048];
+        let text_read = file
+            .read(&mut text_probe)
+            .with_context(|| format!("无法读取 rootfs 文本探针: {path}"))?;
+        let mut combined = Vec::with_capacity(read + text_read);
+        combined.extend_from_slice(&header[..read]);
+        combined.extend_from_slice(&text_probe[..text_read]);
+        let probe_text = String::from_utf8_lossy(&combined).to_lowercase();
+
+        if probe_text.contains("<html")
+            || probe_text.contains("<!doctype html")
+            || probe_text.contains("access denied")
+            || probe_text.contains("error 404")
+        {
+            anyhow::bail!("rootfs 内容疑似 HTML 错误页");
+        }
+
+        if !is_gzip {
+            anyhow::bail!("rootfs 不是有效的 gzip 归档文件（缺少 0x1F8B 头）");
+        }
+
+        Ok(())
     }
 
     /// 当 rootfs URL 全部失败时，回退：安装 Ubuntu-22.04 后导出再导入为实例名。
