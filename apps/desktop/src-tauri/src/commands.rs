@@ -414,11 +414,28 @@ async fn sync_vm_proxy_settings(
         env_lines.push("# Proxy disabled".to_string());
     }
 
-    let env_content = env_lines.join("\n");
     let source_line = "test -f \"$HOME/.agentbox/proxy.env\" && . \"$HOME/.agentbox/proxy.env\"";
-    let sync_cmd = format!(
-        "mkdir -p \"$HOME/.agentbox\" && cat > \"$HOME/.agentbox/proxy.env\" <<'__AGENTBOX_PROXY_EOF__'\n{env_content}\n__AGENTBOX_PROXY_EOF__\nchmod 600 \"$HOME/.agentbox/proxy.env\"\nfor rc in \"$HOME/.bashrc\" \"$HOME/.profile\"; do touch \"$rc\"; grep -qxF '{source_line}' \"$rc\" || printf '%s\\n' '{source_line}' >> \"$rc\"; done"
-    );
+
+    // Build the sync command WITHOUT heredoc.
+    // Heredoc syntax passed through `wsl.exe -- sh -c` is unreliable on Windows:
+    // CRLF conversion can corrupt the terminator, causing sh to read stdin instead of
+    // the script for heredoc content, which breaks the rest of the script.
+    // Writing line-by-line with printf avoids this entirely.
+    // Also guard $HOME: freshly-imported WSL distros may start with empty HOME.
+    let mut cmd_parts: Vec<String> = vec![
+        r#"HOME="${HOME:-/root}""#.to_string(),
+        r#"mkdir -p "$HOME/.agentbox""#.to_string(),
+        r#": > "$HOME/.agentbox/proxy.env""#.to_string(),
+        r#"chmod 600 "$HOME/.agentbox/proxy.env""#.to_string(),
+    ];
+    for line in &env_lines {
+        let esc = shell_escape(line);
+        cmd_parts.push(format!(r#"printf '%s\n' '{esc}' >> "$HOME/.agentbox/proxy.env""#));
+    }
+    cmd_parts.push(format!(
+        r#"for rc in "$HOME/.bashrc" "$HOME/.profile"; do touch "$rc" 2>/dev/null || true; grep -qxF '{source_line}' "$rc" 2>/dev/null || printf '%s\n' '{source_line}' >> "$rc" 2>/dev/null || true; done"#
+    ));
+    let sync_cmd = cmd_parts.join(" && ");
 
     vm.shell_run(&sync_cmd).await.map_err(|e| e.to_string())?;
     Ok(())
