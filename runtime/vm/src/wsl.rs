@@ -494,65 +494,71 @@ docker info >/dev/null 2>&1 || { echo "docker daemon not ready" >&2; exit 1; }
             return self.start(&config.name).await;
         }
 
-        // Always import a fresh Ubuntu rootfs as the target distro name.
-        info!("Downloading Ubuntu rootfs for import...");
         let appdata = std::env::var("LOCALAPPDATA")
             .unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Local".into());
         let install_dir = format!("{}\\AgentBox\\{}", appdata, config.name);
         let workspace_dir = format!("{}\\AgentBox", appdata);
         std::fs::create_dir_all(&workspace_dir)?;
-        let rootfs_path = format!("{}\\{}-ubuntu-rootfs.tar.gz", workspace_dir, config.name);
 
-        let downloaded = Self::download_ubuntu_rootfs(&rootfs_path, config.ubuntu_image.as_deref()).await;
-        if downloaded.is_ok() {
-            // --import 的目标目录必须为空（或不存在）
-            if Path::new(&install_dir).exists() {
-                std::fs::remove_dir_all(&install_dir)
-                    .with_context(|| format!("清理旧安装目录失败: {}", install_dir))?;
-            }
-
-            let import = tokio::process::Command::new("wsl.exe")
-                .args(["--import", &config.name, &install_dir, &rootfs_path, "--version", "2"])
-                .output()
-                .await
-                .context("Failed to import WSL distro")?;
-
-            if !import.status.success() {
-                let stderr = Self::decode_windows_output(&import.stderr);
-                let stdout = Self::decode_windows_output(&import.stdout);
-                let _ = Self::run_wsl(&["--unregister", &config.name]).await;
-                let lower = format!("{}\n{}", stdout, stderr).to_lowercase();
-                if lower.contains("hcs_e_hyperv_not_installed")
-                    || lower.contains("enablevirtualization")
-                    || lower.contains("registerdistro/createvm")
-                    || lower.contains("不支持 wsl")
-                {
-                    anyhow::bail!(
-                        "WSL2 无法创建虚拟机（宿主机不支持嵌套虚拟化 / 缺少 Hyper-V）。\n\
-                         常见原因：\n\
-                         • 云服务器（阿里云 / 腾讯云 / AWS / Azure 等）实例默认不开启嵌套虚拟化\n\
-                         • Windows 物理机 BIOS 中未启用 VT-x / AMD-V\n\
-                         解决方法：\n\
-                         1) 云服务器 → 联系云厂商开启嵌套虚拟化，或改用裸金属 / 支持嵌套虚拟化的机型；\n\
-                         2) 物理机 → 在 BIOS 启用虚拟化后，执行：wsl --install --no-distribution；\n\
-                         3) 改用 QEMU 模式（无需 WSL / Hyper-V）→ 删除本实例，重新部署时在运行时选项中选择「QEMU」。\n\
-                         原始输出:\nstdout: {stdout}\nstderr: {stderr}"
-                    );
-                }
-                anyhow::bail!("WSL import failed:\nstdout: {stdout}\nstderr: {stderr}");
-            }
-
-            let _ = std::fs::remove_file(&rootfs_path);
-            info!(name = %config.name, "WSL distro imported successfully");
-        } else {
-            warn!(
-                "rootfs download failed, trying fallback import from existing/default Ubuntu: {}",
-                downloaded
-                    .err()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "unknown error".to_string())
-            );
+        // 优先复用本机已有 Ubuntu 发行版——国内网络下这条路最快最可靠。
+        // 只有在本机没有任何可用 Ubuntu 时才尝试下载 rootfs。
+        if let Some(existing) = Self::detect_ubuntu_distro_name().await {
+            info!(name = %config.name, source = %existing, "本机已有 Ubuntu，跳过 rootfs 下载，直接导入");
             Self::import_from_ubuntu_2204_fallback(&config.name, &install_dir).await?;
+        } else {
+            // 本机无 Ubuntu，尝试下载 rootfs
+            info!("本机无现有 Ubuntu 发行版，尝试下载 rootfs...");
+            let rootfs_path = format!("{}\\{}-ubuntu-rootfs.tar.gz", workspace_dir, config.name);
+
+            let downloaded = Self::download_ubuntu_rootfs(&rootfs_path, config.ubuntu_image.as_deref()).await;
+            if downloaded.is_ok() {
+                // --import 的目标目录必须为空（或不存在）
+                if Path::new(&install_dir).exists() {
+                    std::fs::remove_dir_all(&install_dir)
+                        .with_context(|| format!("清理旧安装目录失败: {}", install_dir))?;
+                }
+
+                let import = tokio::process::Command::new("wsl.exe")
+                    .args(["--import", &config.name, &install_dir, &rootfs_path, "--version", "2"])
+                    .output()
+                    .await
+                    .context("Failed to import WSL distro")?;
+
+                if !import.status.success() {
+                    let stderr = Self::decode_windows_output(&import.stderr);
+                    let stdout = Self::decode_windows_output(&import.stdout);
+                    let _ = Self::run_wsl(&["--unregister", &config.name]).await;
+                    let lower = format!("{}\n{}", stdout, stderr).to_lowercase();
+                    if lower.contains("hcs_e_hyperv_not_installed")
+                        || lower.contains("enablevirtualization")
+                        || lower.contains("registerdistro/createvm")
+                        || lower.contains("不支持 wsl")
+                    {
+                        anyhow::bail!(
+                            "WSL2 无法创建虚拟机（宿主机不支持嵌套虚拟化 / 缺少 Hyper-V）。\n\
+                             常见原因：\n\
+                             • 云服务器（阿里云 / 腾讯云 / AWS / Azure 等）实例默认不开启嵌套虚拟化\n\
+                             • Windows 物理机 BIOS 中未启用 VT-x / AMD-V\n\
+                             解决方法：\n\
+                             1) 云服务器 → 联系云厂商开启嵌套虚拟化，或改用裸金属 / 支持嵌套虚拟化的机型；\n\
+                             2) 物理机 → 在 BIOS 启用虚拟化后，执行：wsl --install --no-distribution；\n\
+                             3) 改用 QEMU 模式（无需 WSL / Hyper-V）→ 删除本实例，重新部署时在运行时选项中选择「QEMU」。\n\
+                             原始输出:\nstdout: {stdout}\nstderr: {stderr}"
+                        );
+                    }
+                    anyhow::bail!("WSL import failed:\nstdout: {stdout}\nstderr: {stderr}");
+                }
+
+                let _ = std::fs::remove_file(&rootfs_path);
+                info!(name = %config.name, "WSL distro imported successfully");
+            } else {
+                // rootfs 下载也失败，最后尝试通过 wsl --install 安装再导入
+                warn!(
+                    "rootfs download failed, trying wsl --install fallback: {}",
+                    downloaded.err().map(|e| e.to_string()).unwrap_or_default()
+                );
+                Self::import_from_ubuntu_2204_fallback(&config.name, &install_dir).await?;
+            }
         }
 
         // Set resource limits via .wslconfig
