@@ -132,12 +132,20 @@ impl WslProvider {
         let candidates: Vec<&str> = if prefer_jammy {
             vec![
                 "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://mirror.sjtu.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
                 "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://mirror.sjtu.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
             ]
         } else {
             vec![
                 "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://mirror.sjtu.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
                 "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://mirrors.tuna.tsinghua.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://mirror.sjtu.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
             ]
         };
 
@@ -369,11 +377,104 @@ impl VmProvider for WslProvider {
 
     async fn install_docker(&self, name: &str) -> Result<()> {
         info!(distro = name, "Installing Docker inside WSL distro...");
-        Self::shell_exec(
-            name,
-            "curl -fsSL https://get.docker.com | sudo sh && sudo usermod -aG docker $(whoami) && sudo service docker start",
-        )
-        .await?;
+
+                // 国内网络优先使用镜像源，失败后再回退到官方脚本与 ubuntu docker.io。
+                let install_cmd = r#"
+if command -v docker >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1; then
+        sudo service docker start >/dev/null 2>&1 || true
+    else
+        service docker start >/dev/null 2>&1 || true
+    fi
+    exit 0
+fi
+
+if command -v sudo >/dev/null 2>&1; then
+    SUDO=sudo
+else
+    SUDO=
+fi
+
+configure_cn_apt_mirror() {
+    if [ -f /etc/apt/sources.list ]; then
+        $SUDO sed -i -E \
+            -e 's@https?://archive.ubuntu.com/ubuntu@https://mirrors.ustc.edu.cn/ubuntu@g' \
+            -e 's@https?://security.ubuntu.com/ubuntu@https://mirrors.ustc.edu.cn/ubuntu@g' \
+            /etc/apt/sources.list || true
+    fi
+
+    if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+        $SUDO sed -i -E \
+            -e 's@https?://archive.ubuntu.com/ubuntu@https://mirrors.ustc.edu.cn/ubuntu@g' \
+            -e 's@https?://security.ubuntu.com/ubuntu@https://mirrors.ustc.edu.cn/ubuntu@g' \
+            /etc/apt/sources.list.d/ubuntu.sources || true
+    fi
+}
+
+apt_update_retry() {
+    for i in 1 2 3; do
+        if $SUDO apt-get update -y; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+configure_cn_apt_mirror
+apt_update_retry || true
+$SUDO apt-get install -y ca-certificates curl gnupg lsb-release apt-transport-https
+
+install_docker_via_cn_repo() {
+    ARCH="$(dpkg --print-architecture)"
+    CODENAME="$(. /etc/os-release && echo ${VERSION_CODENAME:-jammy})"
+
+    $SUDO install -m 0755 -d /etc/apt/keyrings
+    if curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg -o /tmp/docker-ce.gpg; then
+        :
+    elif curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker-ce.gpg; then
+        :
+    else
+        return 1
+    fi
+
+    $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg /tmp/docker-ce.gpg || return 1
+    $SUDO chmod a+r /etc/apt/keyrings/docker.gpg || true
+
+    echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/ubuntu ${CODENAME} stable" \
+        | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
+
+    apt_update_retry || return 1
+    $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+}
+
+if install_docker_via_cn_repo; then
+    echo "Docker installed via CN Docker mirror repo"
+elif curl -fsSL https://get.docker.com | $SUDO sh; then
+    echo "Docker installed via get.docker.com"
+else
+    echo "Docker mirror + get.docker.com failed, falling back to apt docker.io"
+    apt_update_retry || true
+    $SUDO apt-get install -y docker.io
+fi
+
+if ! getent group docker >/dev/null 2>&1; then
+    $SUDO groupadd docker || true
+fi
+
+TARGET_USER="${SUDO_USER:-$(id -un)}"
+if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
+    $SUDO usermod -aG docker "$TARGET_USER" || true
+fi
+
+if command -v systemctl >/dev/null 2>&1; then
+    $SUDO systemctl enable --now docker >/dev/null 2>&1 || true
+fi
+$SUDO service docker start >/dev/null 2>&1 || true
+docker info >/dev/null 2>&1 || { echo "docker daemon not ready"; exit 1; }
+"#;
+
+                Self::shell_exec(name, install_cmd).await?;
         info!(distro = name, "Docker installed in WSL");
         Ok(())
     }
