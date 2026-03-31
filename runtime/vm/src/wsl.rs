@@ -235,26 +235,53 @@ impl WslProvider {
         Ok(())
     }
 
-    /// 当 rootfs URL 全部失败时，回退：安装 Ubuntu-22.04 后导出再导入为实例名。
+    /// 当 rootfs URL 全部失败时，回退：优先复用本机已有 Ubuntu，再尝试自动安装后导出导入为实例名。
     async fn import_from_ubuntu_2204_fallback(name: &str, install_dir: &str) -> Result<()> {
-        info!("rootfs 下载失败，尝试回退流程：wsl --install -d Ubuntu-22.04");
+        // 先尝试复用本机已存在的 Ubuntu，避免因为无管理员权限导致 install 失败。
+        let source = if let Some(existing) = Self::detect_ubuntu_distro_name().await {
+            info!(distro = %existing, "检测到已存在 Ubuntu 发行版，使用现有 distro 进行 fallback 导入");
+            existing
+        } else {
+            info!("rootfs 下载失败，未检测到 Ubuntu，尝试自动安装 Ubuntu 后再导入");
 
-        let install = tokio::process::Command::new("wsl.exe")
-            .args(["--install", "-d", "Ubuntu-22.04"])
-            .output()
-            .await
-            .context("执行 wsl --install -d Ubuntu-22.04 失败")?;
+            // 先尝试不指定版本，兼容用户默认 Ubuntu 渠道。
+            let install_attempts = [
+                vec!["--install", "-d", "Ubuntu"],
+                vec!["--install", "-d", "Ubuntu-22.04"],
+                vec!["--install", "-d", "Ubuntu-24.04"],
+            ];
 
-        if !install.status.success() {
-            let stderr = String::from_utf8_lossy(&install.stderr);
-            anyhow::bail!(
-                "rootfs 下载失败，且 Ubuntu-22.04 自动安装失败: {stderr}\n请手动执行: wsl --install -d Ubuntu-22.04"
-            );
-        }
+            let mut install_errors = Vec::new();
+            let mut installed = false;
+            for args in install_attempts {
+                let output = tokio::process::Command::new("wsl.exe")
+                    .args(&args)
+                    .output()
+                    .await
+                    .with_context(|| format!("执行 wsl {} 失败", args.join(" ")))?;
 
-        let source = Self::detect_ubuntu_distro_name()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("未检测到可导出的 Ubuntu 发行版，请先手动执行 wsl --install -d Ubuntu-22.04"))?;
+                if output.status.success() {
+                    installed = true;
+                    break;
+                }
+
+                let stderr = Self::decode_windows_output(&output.stderr);
+                install_errors.push(format!("wsl {} => {}", args.join(" "), stderr.trim()));
+            }
+
+            if !installed {
+                anyhow::bail!(
+                    "rootfs 下载失败，且自动安装 Ubuntu 失败。\n{}\n请手动安装任一 Ubuntu 发行版后重试，例如：wsl --install -d Ubuntu",
+                    install_errors.join("\n")
+                );
+            }
+
+            Self::detect_ubuntu_distro_name().await.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "自动安装成功但未检测到可导出的 Ubuntu 发行版，请手动确认 `wsl --list --quiet` 输出"
+                )
+            })?
+        };
 
         let parent_dir = Path::new(install_dir)
             .parent()
