@@ -378,103 +378,110 @@ impl VmProvider for WslProvider {
     async fn install_docker(&self, name: &str) -> Result<()> {
         info!(distro = name, "Installing Docker inside WSL distro...");
 
-                // 国内网络优先使用镜像源，失败后再回退到官方脚本与 ubuntu docker.io。
-                let install_cmd = r#"
+        // 国内网络策略：
+        // 1. 先将 Ubuntu APT 切换为中科大镜像（不需要额外 GPG，最可靠）
+        // 2. 优先 apt install docker.io（Ubuntu 内置包，通过 CN 镜像安装，无需第三方源）
+        // 3. 失败才回退阿里云 Docker CE 仓库（用 printf 写 sources 条目避免变量空值）
+        // DEBIAN_FRONTEND=noninteractive 消除 debconf/Dialog 告警。
+        let install_cmd = r#"
+export DEBIAN_FRONTEND=noninteractive
+export DEBCONF_NONINTERACTIVE_SEEN=true
+
 if command -v docker >/dev/null 2>&1; then
-    if command -v sudo >/dev/null 2>&1; then
-        sudo service docker start >/dev/null 2>&1 || true
-    else
-        service docker start >/dev/null 2>&1 || true
-    fi
-    exit 0
+  if command -v sudo >/dev/null 2>&1; then
+    sudo service docker start >/dev/null 2>&1 || true
+  else
+    service docker start >/dev/null 2>&1 || true
+  fi
+  exit 0
 fi
 
 if command -v sudo >/dev/null 2>&1; then
-    SUDO=sudo
+  SUDO=sudo
 else
-    SUDO=
+  SUDO=
 fi
 
-configure_cn_apt_mirror() {
-    if [ -f /etc/apt/sources.list ]; then
-        $SUDO sed -i -E \
-            -e 's@https?://archive.ubuntu.com/ubuntu@https://mirrors.ustc.edu.cn/ubuntu@g' \
-            -e 's@https?://security.ubuntu.com/ubuntu@https://mirrors.ustc.edu.cn/ubuntu@g' \
-            /etc/apt/sources.list || true
-    fi
-
-    if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-        $SUDO sed -i -E \
-            -e 's@https?://archive.ubuntu.com/ubuntu@https://mirrors.ustc.edu.cn/ubuntu@g' \
-            -e 's@https?://security.ubuntu.com/ubuntu@https://mirrors.ustc.edu.cn/ubuntu@g' \
-            /etc/apt/sources.list.d/ubuntu.sources || true
-    fi
-}
+# 把 Ubuntu 官方源替换为中科大镜像，兼容 sources.list 和 DEB822 两种格式
+for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+  [ -f "$f" ] || continue
+  $SUDO sed -i \
+    -e 's|http://archive.ubuntu.com/ubuntu|https://mirrors.ustc.edu.cn/ubuntu|g' \
+    -e 's|http://security.ubuntu.com/ubuntu|https://mirrors.ustc.edu.cn/ubuntu|g' \
+    -e 's|https://archive.ubuntu.com/ubuntu|https://mirrors.ustc.edu.cn/ubuntu|g' \
+    -e 's|https://security.ubuntu.com/ubuntu|https://mirrors.ustc.edu.cn/ubuntu|g' \
+    "$f" || true
+done
 
 apt_update_retry() {
-    for i in 1 2 3; do
-        if $SUDO apt-get update -y; then
-            return 0
-        fi
-        sleep 2
-    done
-    return 1
+  for i in 1 2 3; do
+    if $SUDO apt-get update -y 2>&1; then return 0; fi
+    sleep 3
+  done
+  return 1
 }
 
-configure_cn_apt_mirror
 apt_update_retry || true
-$SUDO apt-get install -y ca-certificates curl gnupg lsb-release apt-transport-https
+$SUDO apt-get install -y ca-certificates curl gnupg apt-transport-https || true
 
-install_docker_via_cn_repo() {
-    ARCH="$(dpkg --print-architecture)"
-    CODENAME="$(. /etc/os-release && echo ${VERSION_CODENAME:-jammy})"
+INSTALLED=false
 
-    $SUDO install -m 0755 -d /etc/apt/keyrings
-    if curl -fsSL https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg -o /tmp/docker-ce.gpg; then
-        :
-    elif curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker-ce.gpg; then
-        :
-    else
-        return 1
-    fi
+# 方案 1：docker.io（Ubuntu 内置包，通过 CN 镜像安装，不依赖第三方 GPG）
+if $SUDO apt-get install -y docker.io 2>&1; then
+  INSTALLED=true
+  echo "Docker installed via Ubuntu docker.io (CN mirror)"
+fi
 
-    $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg /tmp/docker-ce.gpg || return 1
-    $SUDO chmod a+r /etc/apt/keyrings/docker.gpg || true
+# 方案 2：Docker CE via 阿里云仓库（用 printf 写 sources 条目，避免变量空值引起格式错误）
+if [ "$INSTALLED" = "false" ]; then
+  ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+  CODENAME=""
+  if [ -f /etc/os-release ]; then
+    CODENAME="$(. /etc/os-release && printf '%s' "${VERSION_CODENAME:-}")"
+  fi
+  CODENAME="${CODENAME:-jammy}"
 
-    echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/ubuntu ${CODENAME} stable" \
-        | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
-
-    apt_update_retry || return 1
-    $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-}
-
-if install_docker_via_cn_repo; then
-    echo "Docker installed via CN Docker mirror repo"
-elif curl -fsSL https://get.docker.com | $SUDO sh; then
-    echo "Docker installed via get.docker.com"
-else
-    echo "Docker mirror + get.docker.com failed, falling back to apt docker.io"
+  $SUDO install -m 0755 -d /etc/apt/keyrings
+  if curl -fsSL --retry 3 --retry-delay 2 \
+      "https://mirrors.aliyun.com/docker-ce/linux/ubuntu/gpg" \
+      | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null; then
+    $SUDO chmod a+r /etc/apt/keyrings/docker.gpg
+    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://mirrors.aliyun.com/docker-ce/linux/ubuntu %s stable\n' \
+      "$ARCH" "$CODENAME" \
+      | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
     apt_update_retry || true
-    $SUDO apt-get install -y docker.io
+    if $SUDO apt-get install -y docker-ce docker-ce-cli containerd.io 2>&1; then
+      INSTALLED=true
+      echo "Docker CE installed via Aliyun mirror"
+    else
+      $SUDO rm -f /etc/apt/sources.list.d/docker.list
+    fi
+  fi
 fi
 
+if [ "$INSTALLED" = "false" ]; then
+  echo "所有 Docker 安装方式均失败，请检查网络后重试" >&2
+  exit 1
+fi
+
+# 确保 docker 组存在后再 usermod
 if ! getent group docker >/dev/null 2>&1; then
-    $SUDO groupadd docker || true
+  $SUDO groupadd docker || true
 fi
-
 TARGET_USER="${SUDO_USER:-$(id -un)}"
 if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != "root" ]; then
-    $SUDO usermod -aG docker "$TARGET_USER" || true
+  $SUDO usermod -aG docker "$TARGET_USER" || true
 fi
 
 if command -v systemctl >/dev/null 2>&1; then
-    $SUDO systemctl enable --now docker >/dev/null 2>&1 || true
+  $SUDO systemctl enable --now docker >/dev/null 2>&1 || true
 fi
 $SUDO service docker start >/dev/null 2>&1 || true
-docker info >/dev/null 2>&1 || { echo "docker daemon not ready"; exit 1; }
+
+docker info >/dev/null 2>&1 || { echo "docker daemon not ready" >&2; exit 1; }
 "#;
 
-                Self::shell_exec(name, install_cmd).await?;
+        Self::shell_exec(name, install_cmd).await?;
         info!(distro = name, "Docker installed in WSL");
         Ok(())
     }
