@@ -122,7 +122,8 @@ impl WslProvider {
     /// Ubuntu 官方 WSL rootfs 的 URL 格式历史上曾多次变动，
     /// 使用候选列表可以对抗 CDN 路径调整导致的 404。
     async fn download_ubuntu_rootfs(dest_path: &str, ubuntu_image: Option<&str>) -> Result<()> {
-        // 根据用户镜像选择调整优先级：noble（24.04）/ jammy（22.04）。
+        // 根据用户镜像选择调整优先级：默认 Ubuntu（不固定版本）/ desktop。
+        // `ubuntu-default` 代表不固定版本，优先走稳定可用镜像地址。
         let prefer_jammy = matches!(
             ubuntu_image.map(|s| s.to_lowercase()),
             Some(v) if v.contains("jammy") || v.contains("22.04") || v.contains("desktop")
@@ -131,18 +132,12 @@ impl WslProvider {
         let candidates: Vec<&str> = if prefer_jammy {
             vec![
                 "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
-                "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
                 "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
-                "https://cloud-images.ubuntu.com/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
-                "https://cloud-images.ubuntu.com/wsl/releases/noble/release/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
             ]
         } else {
             vec![
-                "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
                 "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
-                "https://cloud-images.ubuntu.com/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
-                "https://cloud-images.ubuntu.com/wsl/releases/noble/release/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
-                "https://cloud-images.ubuntu.com/wsl/jammy/current/ubuntu-jammy-wsl-amd64-wsl.rootfs.tar.gz",
+                "https://mirrors.ustc.edu.cn/ubuntu-cloud-images/wsl/noble/current/ubuntu-noble-wsl-amd64-wsl.rootfs.tar.gz",
             ]
         };
 
@@ -443,7 +438,7 @@ impl VmProvider for WslProvider {
             info!(name = %config.name, "WSL distro imported successfully");
         } else {
             warn!(
-                "rootfs download failed, trying fallback Ubuntu-22.04 install/import: {}",
+                "rootfs download failed, trying fallback import from existing/default Ubuntu: {}",
                 downloaded
                     .err()
                     .map(|e| e.to_string())

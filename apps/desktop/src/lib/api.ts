@@ -106,7 +106,7 @@ export interface SshConnectionInfo {
 
 export interface CreateAgentOptions {
   runtime_mode?: "auto" | "wsl" | "qemu";
-  ubuntu_image?: "noble" | "jammy" | "ubuntu-22.04-desktop";
+  ubuntu_image?: "ubuntu-default" | "ubuntu-22.04-desktop";
   qemu_iso_path?: string;
 }
 

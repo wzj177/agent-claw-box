@@ -129,6 +129,7 @@ function AgentCard({
   const ubuntuImageLabel = (() => {
     const image = (agent.ubuntu_image ?? "").toLowerCase();
     if (!image) return "默认";
+    if (image.includes("default") || image.includes("ubuntu-lts")) return "默认 Ubuntu";
     if (image.includes("noble")) return "Ubuntu 24.04";
     if (image.includes("jammy") || image.includes("22.04")) return "Ubuntu 22.04";
     return agent.ubuntu_image ?? "默认";

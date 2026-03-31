@@ -25,7 +25,7 @@ export function MarketplacePage() {
   const [provisioning, setProvisioning] = useState(false);
   const [deployDialog, setDeployDialog] = useState<TemplateInfo | null>(null);
   const [runtimeMode, setRuntimeMode] = useState<"auto" | "wsl" | "qemu">("auto");
-  const [ubuntuImage, setUbuntuImage] = useState<"noble" | "jammy" | "ubuntu-22.04-desktop">("noble");
+  const [ubuntuImage, setUbuntuImage] = useState<"ubuntu-default" | "ubuntu-22.04-desktop">("ubuntu-default");
   const [qemuIsoPath, setQemuIsoPath] = useState("");
 
   useEffect(() => {
@@ -87,7 +87,7 @@ export function MarketplacePage() {
       return;
     }
     setRuntimeMode("auto");
-    setUbuntuImage("noble");
+    setUbuntuImage("ubuntu-default");
     setQemuIsoPath("");
     setDeployDialog(template);
   };
@@ -96,7 +96,7 @@ export function MarketplacePage() {
     if (!deployDialog) return;
     const opts: CreateAgentOptions = {
       runtime_mode: runtimeMode,
-      ubuntu_image: ubuntuImage,
+      ubuntu_image: runtimeMode === "qemu" ? undefined : ubuntuImage,
       qemu_iso_path: qemuIsoPath.trim() || undefined,
     };
     const template = deployDialog;
@@ -224,7 +224,7 @@ export function MarketplacePage() {
             <div>
               <h3 className="text-base font-semibold text-neutral-800">部署 {deployDialog.name}</h3>
               <p className="text-caption text-neutral-500 mt-1">
-                请选择运行模式和 Ubuntu 镜像版本。
+                请选择运行模式和镜像来源。
               </p>
             </div>
 
@@ -242,14 +242,14 @@ export function MarketplacePage() {
             </div>
 
             <div className="space-y-2">
-              <label className="block text-caption text-neutral-600">Ubuntu 镜像</label>
+              <label className="block text-caption text-neutral-600">WSL 镜像策略</label>
               <select
                 value={ubuntuImage}
-                onChange={(e) => setUbuntuImage(e.target.value as "noble" | "jammy" | "ubuntu-22.04-desktop")}
+                onChange={(e) => setUbuntuImage(e.target.value as "ubuntu-default" | "ubuntu-22.04-desktop")}
                 className="w-full px-3 py-2 text-body bg-white border border-neutral-300 rounded-md focus:outline-none focus:border-primary-400 focus:ring-1 focus:ring-primary-100"
+                disabled={runtimeMode === "qemu"}
               >
-                <option value="noble">Ubuntu 24.04（Noble，默认）</option>
-                <option value="jammy">Ubuntu 22.04（Jammy，稳定）</option>
+                <option value="ubuntu-default">默认 Ubuntu（推荐，不固定版本）</option>
                 {systemInfo?.wsl_gui_supported && (
                   <option value="ubuntu-22.04-desktop">Ubuntu Desktop 22.04（WSL 图形界面）</option>
                 )}
@@ -274,22 +274,22 @@ export function MarketplacePage() {
 
             {(runtimeMode === "qemu" || runtimeMode === "auto") && (
               <div className="space-y-2">
-                <label className="block text-caption text-neutral-600">QEMU 本地 ISO 文件（可选）</label>
+                <label className="block text-caption text-neutral-600">QEMU 上传镜像（ISO，可选）</label>
                 <div className="flex items-center gap-2">
                   <input
                     type="text"
                     value={qemuIsoPath}
                     onChange={(e) => setQemuIsoPath(e.target.value)}
-                    placeholder="例如: C:\\Users\\admin\\Downloads\\alpine-virt.iso"
+                    placeholder="例如: C:\\Users\\admin\\Downloads\\custom-image.iso"
                     className="flex-1 px-3 py-2 text-body bg-white border border-neutral-300 rounded-md focus:outline-none focus:border-primary-400 focus:ring-1 focus:ring-primary-100"
                   />
-                  <button type="button" onClick={pickIsoFile} className="btn-default" title="选择 ISO 文件">
+                  <button type="button" onClick={pickIsoFile} className="btn-default" title="上传本地 ISO">
                     <FolderOpen className="w-3.5 h-3.5" />
-                    选择
+                    上传
                   </button>
                 </div>
                 <p className="text-caption text-neutral-400">
-                  不填则自动下载（最长等待 10 分钟）；填写后将优先使用本地 ISO，避免慢速下载。
+                  不上传则自动下载基础镜像（最长等待 10 分钟）；上传后会优先使用你本地镜像部署。
                 </p>
               </div>
             )}
