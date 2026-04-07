@@ -418,17 +418,21 @@ impl VmProvider for LimaProvider {
         match output {
             Ok(o) if o.status.success() => {
                 let stdout = String::from_utf8_lossy(&o.stdout);
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                    let status_str = val.get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown");
-                    match status_str {
-                        "Running" => Ok(VmStatus::Running),
-                        "Stopped" => Ok(VmStatus::Stopped),
-                        _ => Ok(VmStatus::Error(status_str.to_string())),
-                    }
-                } else {
-                    Ok(VmStatus::NotCreated)
+                // limactl outputs NDJSON (one JSON object per line). Parse line-by-line
+                // and find the entry whose "name" matches — do NOT feed the whole stdout
+                // to serde_json::from_str, which fails whenever there are multiple lines
+                // or even a trailing newline, causing us to misreport the VM as NotCreated.
+                let status_str = stdout
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|val| val.get("name").and_then(|v| v.as_str()) == Some(name))
+                    .and_then(|val| val.get("status").and_then(|v| v.as_str()).map(|s| s.to_string()));
+
+                match status_str.as_deref() {
+                    Some("Running") => Ok(VmStatus::Running),
+                    Some("Stopped") => Ok(VmStatus::Stopped),
+                    Some(other) => Ok(VmStatus::Error(other.to_string())),
+                    None => Ok(VmStatus::NotCreated),
                 }
             }
             _ => Ok(VmStatus::NotCreated),

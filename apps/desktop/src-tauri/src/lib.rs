@@ -90,6 +90,11 @@ pub fn run() {
                     tracing::warn!("Failed to reconcile agent statuses: {e}");
                 }
 
+                // 1.6 On macOS/Windows, start (but don't provision) the Lima/WSL VM for
+                // every active agent so they are ready by the time autostart or manual
+                // start is triggered. On Linux this is a no-op (native Docker, no VM).
+                commands::resume_agent_vms(&state_clone).await;
+
                 // 2. Auto-start agents
                 if let Err(e) = commands::autostart_agents(&state_clone).await {
                     tracing::error!("Failed to auto-start agents: {e}");

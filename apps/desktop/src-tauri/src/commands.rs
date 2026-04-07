@@ -414,13 +414,60 @@ async fn sync_vm_proxy_settings(
         env_lines.push("# Proxy disabled".to_string());
     }
 
-    let env_content = env_lines.join("\n");
     let source_line = "test -f \"$HOME/.agentbox/proxy.env\" && . \"$HOME/.agentbox/proxy.env\"";
-    let sync_cmd = format!(
-        "mkdir -p \"$HOME/.agentbox\" && cat > \"$HOME/.agentbox/proxy.env\" <<'__AGENTBOX_PROXY_EOF__'\n{env_content}\n__AGENTBOX_PROXY_EOF__\nchmod 600 \"$HOME/.agentbox/proxy.env\"\nfor rc in \"$HOME/.bashrc\" \"$HOME/.profile\"; do touch \"$rc\"; grep -qxF '{source_line}' \"$rc\" || printf '%s\\n' '{source_line}' >> \"$rc\"; done"
-    );
+
+    // Write proxy.env line-by-line with printf to avoid heredoc CRLF issues on Windows.
+    // Also guard $HOME for freshly-imported WSL distros where it may be empty.
+    let mut cmd_parts: Vec<String> = vec![
+        r#"HOME="${HOME:-/root}""#.to_string(),
+        r#"mkdir -p "$HOME/.agentbox""#.to_string(),
+        r#": > "$HOME/.agentbox/proxy.env""#.to_string(),
+        r#"chmod 600 "$HOME/.agentbox/proxy.env""#.to_string(),
+    ];
+    for line in &env_lines {
+        let esc = shell_escape(line);
+        cmd_parts.push(format!(r#"printf '%s\n' '{esc}' >> "$HOME/.agentbox/proxy.env""#));
+    }
+    cmd_parts.push(format!(
+        r#"for rc in "$HOME/.bashrc" "$HOME/.profile"; do touch "$rc" 2>/dev/null || true; grep -qxF '{source_line}' "$rc" 2>/dev/null || printf '%s\n' '{source_line}' >> "$rc" 2>/dev/null || true; done"#
+    ));
+    let sync_cmd = cmd_parts.join(" && ");
 
     vm.shell_run(&sync_cmd).await.map_err(|e| e.to_string())?;
+
+    // Sync npm proxy / registry settings.
+    // npm does not read HTTP_PROXY env vars automatically for all operations,
+    // so we configure it explicitly via `npm config set`.
+    // - With proxy: set proxy/https-proxy (skip for SOCKS — npm doesn't support it natively)
+    // - Without proxy: clear proxy config and switch to the npmmirror.com registry (CN mirror)
+    let npm_cmd = if settings.proxy_enabled {
+        if let Some(proxy_url) = settings.proxy_url.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+            let vm_proxy_url = rewrite_proxy_url_for_vm(vm, proxy_url).await;
+            if is_socks_proxy_url(&vm_proxy_url) {
+                // SOCKS proxy: npm does not support SOCKS natively; clear any stale config
+                // and fall back to official registry (proxy tunnel handles it at OS level).
+                r#"command -v npm >/dev/null 2>&1 && npm config delete proxy 2>/dev/null; npm config delete https-proxy 2>/dev/null; npm config delete registry 2>/dev/null; true"#.to_string()
+            } else {
+                let esc = shell_escape(&vm_proxy_url);
+                format!(
+                    r#"command -v npm >/dev/null 2>&1 && npm config set proxy '{esc}' && npm config set https-proxy '{esc}' && npm config delete registry 2>/dev/null; true"#
+                )
+            }
+        } else {
+            // proxy_enabled but no URL — treat as disabled
+            r#"command -v npm >/dev/null 2>&1 && npm config delete proxy 2>/dev/null; npm config delete https-proxy 2>/dev/null; npm config set registry https://registry.npmmirror.com; true"#.to_string()
+        }
+    } else {
+        // No proxy — use domestic CN mirror for npm
+        r#"command -v npm >/dev/null 2>&1 && npm config delete proxy 2>/dev/null; npm config delete https-proxy 2>/dev/null; npm config set registry https://registry.npmmirror.com; true"#.to_string()
+    };
+    // Use PATH that includes common npm locations in case npm is installed in a non-default dir.
+    let npm_full_cmd = format!(
+        r#"export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"; {npm_cmd}"#
+    );
+    // Non-fatal: if npm isn't installed yet the command exits via `true`.
+    let _ = vm.shell_run(&npm_full_cmd).await;
+
     Ok(())
 }
 
@@ -1316,15 +1363,15 @@ pub async fn create_agent(
             qemu_iso_path: qemu_iso_path_clone.clone(),
         }));
         let docker = agentbox_docker::ContainerRuntime::with_prefix(vm.docker_cmd_prefix());
-        // 30-minute timeout prevents agents from being stuck in CREATING forever
-        // (native agents like OpenClaw may need 20+ min for npm install with retries)
+        // 60-minute timeout prevents agents from being stuck in CREATING forever
+        // (native agents like OpenClaw may need 40+ min for npm install on slow networks)
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(30 * 60),
+            std::time::Duration::from_secs(60 * 60),
             provision_agent(&app_state, &docker, &vm, &tmpl, &c_name, port, &db, &agent_id),
         ).await;
         let final_result = match result {
             Ok(r) => r,
-            Err(_) => Err(anyhow::anyhow!("创建超时（超过30分钟），请删除此实例后重试")),
+            Err(_) => Err(anyhow::anyhow!("创建超时（超过60分钟），请删除此实例后重试")),
         };
         let cancelled = provisioning_cancelled_or_deleted(&app_state, &agent_id).await;
         match final_result {
@@ -2637,6 +2684,67 @@ pub async fn get_ssh_info(
 // Internal helpers (not exposed as Tauri commands)
 // ---------------------------------------------------------------------------
 
+/// On macOS/Windows, each agent lives inside its own Lima/WSL VM.
+/// When the app restarts, those VMs are all in Stopped state.
+/// This function starts (but does NOT provision) the VMs for every active
+/// agent, so they are ready before `autostart_agents` or manual start is called.
+/// Errors are logged and ignored individually — one VM failing must not block others.
+pub async fn resume_agent_vms(state: &AppState) {
+    // Only needed on platforms that have per-agent VMs (macOS / Windows).
+    #[cfg(target_os = "linux")]
+    {
+        let _ = state;
+        return;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let agents: Vec<AgentInfo> = match sqlx::query_as(
+            "SELECT * FROM agents WHERE status NOT IN (?, ?) ORDER BY created_at ASC",
+        )
+        .bind(STATUS_CREATING)
+        .bind(STATUS_CREATE_FAILED)
+        .fetch_all(&state.db)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!("resume_agent_vms: failed to query agents: {e}");
+                return;
+            }
+        };
+
+        // Start each VM concurrently; don't wait — caller does not block on us.
+        let handles: Vec<_> = agents
+            .into_iter()
+            .map(|agent| {
+                let vm = vm_for_agent(state, &agent);
+                tokio::spawn(async move {
+                    tracing::info!(
+                        id = %agent.id,
+                        vm = %agent.vm_name,
+                        "resume_agent_vms: starting VM"
+                    );
+                    if let Err(e) = vm.ensure_ready(None).await {
+                        tracing::warn!(
+                            id = %agent.id,
+                            vm = %agent.vm_name,
+                            error = %e,
+                            "resume_agent_vms: failed to start VM (ignored)"
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all concurrent starts to finish so the caller's next step
+        // (autostart_agents, reconcile, …) sees VMs in Running state.
+        for h in handles {
+            let _ = h.await;
+        }
+    }
+}
+
 /// Auto-start all agents that have `auto_start = true`.
 pub async fn autostart_agents(state: &AppState) -> Result<(), String> {
     let settings = load_app_settings(state).await?;
@@ -3148,12 +3256,12 @@ pub async fn copy_agent_vm(
         let docker = app_state.docker_for_vm_name(&vm_name_clone);
         let vm = app_state.vm_for_name(&vm_name_clone);
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(30 * 60),
+            std::time::Duration::from_secs(60 * 60),
             provision_agent(&app_state, &docker, &vm, &tmpl, &c_name, port, &db, &new_agent_id),
         ).await;
         let result = match result {
             Ok(r) => r,
-            Err(_) => Err(anyhow::anyhow!("复制超时（超过30分钟），请删除后重试")),
+            Err(_) => Err(anyhow::anyhow!("复制超时（超过60分钟），请删除后重试")),
         };
         let cancelled = provisioning_cancelled_or_deleted(&app_state, &new_agent_id).await;
         match result {

@@ -70,6 +70,51 @@ impl VmManager {
         }
     }
 
+    /// Run `wsl.exe <args>` with a hard timeout (seconds).
+    ///
+    /// `std::process::Command::output()` can block indefinitely when the
+    /// WSL service (LxssManager) is slow to start or in a bad state.
+    /// This helper spawns wsl.exe in a thread and polls `try_wait` so
+    /// the caller never hangs longer than `timeout_secs`.
+    ///
+    /// Returns `None` on timeout or spawn failure.
+    #[cfg(target_os = "windows")]
+    fn wsl_cmd_with_timeout(
+        args: &[&str],
+        timeout_secs: u64,
+    ) -> Option<std::process::Output> {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let mut child = std::process::Command::new("wsl.exe")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?;
+
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return child.wait_with_output().ok(),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        tracing::warn!(
+                            "wsl.exe {:?} did not respond within {}s — assuming WSL unavailable",
+                            args,
+                            timeout_secs
+                        );
+                        let _ = child.kill();
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// Create a new VmManager with the platform-appropriate provider.
     pub fn new(config: VmConfig) -> Self {
         let (provider, runtime_notice) = Self::detect_provider(&config);
@@ -120,11 +165,12 @@ impl VmManager {
             }
 
             // 优先使用 WSL2；若系统未启用 WSL 或缺少 Hyper-V/虚拟化能力，降级到 QEMU。
-            let wsl_installed = std::process::Command::new("wsl.exe")
-                .arg("--version")
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            //
+            // 使用带超时的探测：在 WSL 服务未就绪（LxssManager 慢启动）时，
+            // wsl.exe 可能无限期阻塞，导致整个 GUI 进程卡死。
+            // 超时设为 8s，超时即视为 WSL 暂不可用并降级到 QEMU，
+            // 用户重启 App 后 WSL 服务通常已就绪。
+            let wsl_installed = Self::wsl_cmd_with_timeout(&["--version"], 8).is_some();
 
             // 用 `wsl --list --quiet` 而非 `wsl --status` 来检测 HCS 可用性。
             // `wsl --status` 不触发 HCS（Hyper-V Container Service）层，即使嵌套虚拟化
@@ -132,10 +178,7 @@ impl VmManager {
             // `wsl --list --quiet` 会真正访问 HCS，在不支持嵌套虚拟化的环境下会在
             // stdout/stderr 中输出 HCS_E_HYPERV_NOT_INSTALLED 等关键词。
             // 注意：不检查 exit code，因为无 distro 时也会返回非 0，但 HCS 是正常的。
-            let wsl_can_create_vm = std::process::Command::new("wsl.exe")
-                .args(["--list", "--quiet"])
-                .output()
-                .ok()
+            let wsl_can_create_vm = Self::wsl_cmd_with_timeout(&["--list", "--quiet"], 8)
                 .map(|o| {
                     let mut all = String::new();
                     all.push_str(&Self::decode_windows_output(&o.stdout));
