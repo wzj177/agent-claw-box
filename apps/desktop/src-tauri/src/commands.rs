@@ -416,17 +416,8 @@ async fn sync_vm_proxy_settings(
 
     let source_line = "test -f \"$HOME/.agentbox/proxy.env\" && . \"$HOME/.agentbox/proxy.env\"";
 
-<<<<<<< HEAD
-    // Build the sync command WITHOUT heredoc.
-    // Heredoc syntax passed through `wsl.exe -- sh -c` is unreliable on Windows:
-    // CRLF conversion can corrupt the terminator, causing sh to read stdin instead of
-    // the script for heredoc content, which breaks the rest of the script.
-    // Writing line-by-line with printf avoids this entirely.
-    // Also guard $HOME: freshly-imported WSL distros may start with empty HOME.
-=======
     // Write proxy.env line-by-line with printf to avoid heredoc CRLF issues on Windows.
     // Also guard $HOME for freshly-imported WSL distros where it may be empty.
->>>>>>> 2dd8a11ff567f56d5bc1289ecd28026eb331a544
     let mut cmd_parts: Vec<String> = vec![
         r#"HOME="${HOME:-/root}""#.to_string(),
         r#"mkdir -p "$HOME/.agentbox""#.to_string(),
